@@ -62,6 +62,30 @@ def test_typed_text_uses_the_current_colour_and_the_pen_is_restored(rig):
     assert rig.term.cursor.attrs.fg == "brown"
 
 
+def test_a_colour_ending_in_0_is_not_a_reset(rig):
+    rig.server(b"\x1b[1m\x1b[38;5;0m$ ")     # bold, colour 0
+    rig.type("e")
+    rig.server(b"e")
+    rig.type("c")
+    assert rig.cell(3).data == "c" and rig.cell(3).bold
+    assert rig.term.cursor.attrs.bold        # still bold for the server's next write
+
+
+def test_prompt_drawn_with_cursor_save_and_restore(rig):
+    rig.server(b"$ \x1b[s\x1b[70G[12:00]\x1b[u")   # a right-hand prompt
+    rig.type("e")
+    rig.server(b"e")
+    rig.type("c")
+    assert rig.line().startswith("$ ec ") and rig.cursor() == (0, 4)
+
+
+def test_nothing_is_drawn_in_line_drawing_mode(rig):
+    rig.confident()
+    rig.server(b"\x1b(0")                    # now "q" shows as a line
+    rig.type("q")
+    assert rig.line() == "$ e"
+
+
 def test_insert_in_the_middle_shifts_the_rest(rig):
     rig.confident()
     rig.type("cho")

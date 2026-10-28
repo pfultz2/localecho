@@ -38,6 +38,18 @@ def test_fast_forward_matches_full_emulation(seed):
     assert p.screen.cursor.attrs == ref.cursor.attrs
 
 
+def test_fast_forward_keeps_the_pen():
+    data = b"".join(b"\x1b[0;1mline %d\x1b[4:3m!\r\n" % i for i in range(60)) + b"\x1b[33m$ "
+    fast = Predictor(24, 80)
+    fast.on_output(data, 0.0)                # one read: most of it is skipped
+    slow = Predictor(24, 80)
+    for i in range(0, len(data), 7):
+        slow.on_output(data[i:i + 7], 0.0)
+    assert fast.screen.cursor.pen == slow.screen.cursor.pen == (b"0;1", b"4:3", b"33")
+    assert fast.screen.cursor.attrs == slow.screen.cursor.attrs
+    assert fast.screen.display == slow.screen.display
+
+
 def test_cursor_addressing_disables_the_shortcut():
     p = Predictor(5, 20)
     p.on_output(b"x\r\n" * 10 + b"\x1b[1;1Htop" + b"\r\ny" * 10, 0.0)

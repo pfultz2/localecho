@@ -45,6 +45,7 @@ drawn while the cursor line looks like a password prompt.
 Requires: pip install pyte
 """
 
+import copy
 import errno
 import fcntl
 import functools
@@ -57,6 +58,7 @@ import struct
 import sys
 import termios
 import time
+import traceback
 import tty
 from collections import defaultdict
 
@@ -65,7 +67,7 @@ try:
     from pyte import charsets as cs
     from pyte import graphics as g
     from pyte import modes as mo
-    from pyte.screens import Char, Margins
+    from pyte.screens import Char, Cursor, Margins
     from wcwidth import wcwidth
 except ImportError:  # pragma: no cover
     sys.exit("localecho: this script needs the pyte package (pip install pyte)")
@@ -76,11 +78,10 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------
 
 # One token of terminal output that matters to us: a string sequence
-# (OSC/DCS/APC/PM/SOS), a CSI sequence, or ESC 7 / ESC 8 / ESC c.
+# (OSC/DCS/APC/PM/SOS) or a CSI sequence.
 OUT_TOKEN_RE = re.compile(
     rb"\x1b(?:([\]P_^X])(.*?)(?:\x07|\x1b\\)"
-    rb"|\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])"
-    rb"|([78c]))",
+    rb"|\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e]))",
     re.S,
 )
 # Keys arriving from the user's terminal.
@@ -177,19 +178,52 @@ def goto(pos):
     return b"\x1b[%d;%dH" % (pos[0] + 1, pos[1] + 1)
 
 
+def sgr_resets(params):
+    """Does SGR `params` reset every attribute, so that earlier SGRs no
+    longer matter?  (The 0 in 38;5;0 is a colour, not a reset.)"""
+    fields = params.split(b";")
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        if f in (b"", b"0"):
+            return True
+        i += 1
+        if f in (b"38", b"48", b"58"):          # colour: skip its arguments
+            i += {b"5": 2, b"2": 4}.get(fields[i] if i < len(fields) else b"", 0)
+    return False
+
+
 # --------------------------------------------------------------------------
 # Shadow terminal: pyte plus the few features it lacks that matter here
 # --------------------------------------------------------------------------
 
+MAX_PEN = 32        # SGRs to replay before falling back to pyte's attributes
+
+
+class PenCursor(Cursor):
+    """pyte's cursor plus its pen: the SGR parameters set since the last
+    full reset, exactly as the server sent them.  Replaying the pen is how
+    the real terminal gets its colours back after we draw; pyte's attrs
+    can't hold all of it (dim, undercurl, underline colour ...).  None if
+    there are too many to replay.  Saving the cursor saves the pen too."""
+    __slots__ = ("pen",)
+
+    def __init__(self, x, y, attrs=Char(" ")):
+        super().__init__(x, y, attrs)
+        self.pen = ()
+
+
 class ShadowScreen(pyte.Screen):
     def __init__(self, columns, lines):
-        self._alt_saved = None
         self.scroll_count = 0
         self._last_char = ""
         super().__init__(columns, lines)
 
     def reset(self):
         super().reset()
+        self.cursor = PenCursor(0, 0)
+        self.savepoints = []
+        self.g1_charset = cs.LAT1_MAP   # as in xterm; pyte defaults to line drawing
         self._main = None
         self.region_scrolled = True
 
@@ -198,20 +232,58 @@ class ShadowScreen(pyte.Screen):
         return self._main is not None
 
     # Alternate screen (vim, less, htop ...). pyte has no alternate buffer.
+    # As in xterm, each screen has its own saved cursor.
     def _alt(self, on, save):
         if on == self.in_alt:
             return
         if on:
             if save:
-                self._alt_saved = (self.cursor.x, self.cursor.y, self.cursor.attrs)
-            self._main = self.buffer
-            self.buffer = defaultdict(self._main.default_factory)
+                self.save_cursor()
+            self._main = (self.buffer, self.savepoints)
+            self.buffer = defaultdict(self.buffer.default_factory)
+            self.savepoints = []
         else:
-            self.buffer, self._main = self._main, None
-            if save and self._alt_saved:
-                self.cursor.x, self.cursor.y, self.cursor.attrs = self._alt_saved
+            (self.buffer, self.savepoints), self._main = self._main, None
+            if save:
+                self.restore_cursor()
         self.dirty.update(range(self.lines))
         self.region_scrolled = True
+
+    # A terminal has one saved cursor, not pyte's stack: saving again
+    # replaces it, and restoring doesn't use it up.
+    def save_cursor(self):
+        super().save_cursor()
+        del self.savepoints[:-1]
+
+    def restore_cursor(self):
+        if self.savepoints:
+            sp = self.savepoints[-1]
+            self.savepoints.append(sp._replace(cursor=copy.copy(sp.cursor)))
+        super().restore_cursor()
+
+    def resize(self, lines=None, columns=None):
+        # pyte saves and restores the cursor around its own work.
+        saved, self.savepoints = self.savepoints, []
+        super().resize(lines, columns)
+        self.savepoints = saved
+
+    def select_graphic_rendition(self, *attrs, private=False):
+        if private:
+            # Sub-parameters pyte can't parse, passed on by Predictor._token.
+            params = bytes(attrs)
+            if b":" in params:
+                self._add_pen(params)
+            return
+        self._add_pen(b";".join(b"%d" % a for a in attrs))
+        super().select_graphic_rendition(*attrs)
+
+    def _add_pen(self, params):
+        pen = self.cursor.pen
+        if sgr_resets(params):
+            pen = () if params == b"0" else (params,)
+        elif pen is not None:
+            pen = pen + (params,) if len(pen) < MAX_PEN else None
+        self.cursor.pen = pen
 
     def _split_alt(self, modes, kwargs, on):
         if not kwargs.get("private"):
@@ -275,12 +347,14 @@ class ShadowScreen(pyte.Screen):
         if self._last_char and not kwargs.get("private"):
             self.draw(self._last_char * min(count or 1, 1000))
 
-    def sco_save(self, *args, **kwargs):  # CSI s
-        if not args and not kwargs.get("private"):
+    # CSI s / CSI u.  pyte passes a 0 when there are no parameters; with
+    # parameters, CSI s sets left and right margins instead.
+    def sco_save(self, *args, **kwargs):
+        if not any(args) and not kwargs.get("private"):
             self.save_cursor()
 
-    def sco_restore(self, *args, **kwargs):  # CSI u
-        if not args and not kwargs.get("private"):
+    def sco_restore(self, *args, **kwargs):
+        if not any(args) and not kwargs.get("private"):
             self.restore_cursor()
 
     def write_process_input(self, data):
@@ -291,6 +365,19 @@ class ShadowStream(pyte.ByteStream):
     csi = dict(pyte.ByteStream.csi)
     csi.update({"S": "scroll_up", "T": "scroll_down", "b": "repeat_char",
                 "s": "sco_save", "u": "sco_restore"})
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Real terminals honour ESC ( 0 and SO/SI (line drawing) in UTF-8
+        # too, but pyte ignores them while use_utf8 is set.  feed() below
+        # always decodes UTF-8 itself, so the flag can be off.
+        self.use_utf8 = False
+
+    def feed(self, data):
+        pyte.Stream.feed(self, self.utf8_decoder.decode(data))
+
+    def select_other_charset(self, code):
+        pass  # ESC % @ / ESC % G: stay with UTF-8
 
 
 def _tolerant(fn):
@@ -344,7 +431,6 @@ class Predictor:
     HARD_TIMEOUT = 5.0       # give up on an unconfirmed prediction
     GRACE = 0.05             # wait this long for the rest of a split echo
     DSR_TIMEOUT = 1.0        # stop waiting for an answer to our cursor query
-    MAX_PEN = 32
 
     MARKS = {"underline": b"\x1b[4m", "grey": b"\x1b[90m", "none": b""}
     MOVES = {b"\x1b[D": -1, b"\x1bOD": -1, b"\x1b[C": 1, b"\x1bOC": 1}
@@ -368,9 +454,6 @@ class Predictor:
         self.held = b""
         self.held_since = 0.0
         self.unsafe = False      # real terminal may be mid-sequence
-        self.pen = []            # SGR params since the last reset
-        self.saved_pen = []
-        self.alt_pen = []
         self.fed = 0
         self.quarantine = False         # no drawing until resynced after a resize
         self.dsr_pending = None
@@ -428,54 +511,35 @@ class Predictor:
         head, tail = data[:pos + 2], data[pos + 2:]
         if NOT_SKIPPABLE_RE.search(head):
             return data
-        # Keep the pen up to date. Every escape in head is an SGR, so only
-        # the ones from the last full reset on matter.
+        # Replay the colours.  Every escape in head is an SGR, and only the
+        # ones from the last full reset on matter.
         start = max(head.rfind(b"\x1b[0m"), head.rfind(b"\x1b[m"), 0)
-        for m in OUT_TOKEN_RE.finditer(head, start):
-            self._token(m)
-        pen = b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in self.pen if b":" not in p)
-        self.stream.feed(b"\r" + b"\n" * rows + pen)
+        sgr = b"".join(map(self._token, OUT_TOKEN_RE.finditer(head, start)))
+        self.stream.feed(b"\r" + b"\n" * rows + sgr)
         sc.region_scrolled = True
         return tail
 
     def _token(self, m):
-        """Track the SGR pen and strip sequences pyte would misparse."""
+        """Strip sequences pyte would misparse, and translate the few it
+        would get wrong."""
         if m.group(1) is not None:          # OSC / DCS / ... : pyte doesn't need them
             return b""
-        if m.group(6) is not None:          # ESC 7 / ESC 8 / ESC c
-            f = m.group(6)
-            if f == b"7":
-                self.saved_pen = list(self.pen)
-            elif f == b"8":
-                self.pen = list(self.saved_pen)
-            else:
-                self.pen = []
-            return m.group(0)
         params, inter, final = m.group(3), m.group(4), m.group(5)
         if final == b"m" and not inter and params[:1] not in (b"<", b"=", b">", b"?"):
-            fields = params.split(b";")
-            if not params or b"0" in fields or b"" in fields:
-                self.pen = [params] if params else []
-            else:
-                self.pen.append(params)
-            return b"" if b":" in params else m.group(0)
+            if b":" in params:
+                # pyte can't parse sub-parameters (4:3 is undercurl), so send
+                # the raw bytes on to the screen's pen as a private SGR, which
+                # keeps them in order with everything else.
+                return b"\x1b[?" + b";".join(b"%d" % c for c in params) + b"m"
+            return m.group(0)
         if params[:1] == b"?" and final not in b"hlJK":
             return b""                      # private sequences pyte doesn't know
         if inter or params[:1] in (b"<", b"=", b">"):
             if inter == b"!" and final == b"p":   # DECSTR soft reset
-                self.pen = []
+                return b"\x1b[m"
             return b""
         if b":" in params:
             return b""
-        if not params and final == b"s":
-            self.saved_pen = list(self.pen)
-        elif not params and final == b"u":
-            self.pen = list(self.saved_pen)
-        elif final in b"hl" and params.startswith(b"?") and b"1049" in params.split(b";"):
-            if final == b"h":
-                self.alt_pen = list(self.pen)
-            else:
-                self.pen = list(self.alt_pen)
         return m.group(0)
 
     def _cell(self, y, x):
@@ -685,9 +749,11 @@ class Predictor:
         return True
 
     def _pen_bytes(self):
-        if len(self.pen) > self.MAX_PEN:
-            return char_style(self.screen.cursor.attrs)
-        return b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in self.pen)
+        """SGR that gives the real terminal the server's pen back."""
+        cur = self.screen.cursor
+        if cur.pen is None:                     # too much to replay
+            return char_style(cur.attrs)
+        return b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in cur.pen)
 
     def _key_char(self, ch, now):
         if self.blocked:
@@ -794,7 +860,9 @@ class Predictor:
         return b""
 
     def finish(self):
-        return self._render(hide=True)
+        """Take our drawing off the screen and pass on what was held back."""
+        out, self.held = self._render(hide=True) + self.held, b""
+        return out
 
     # ---- drawing ----------------------------------------------------------
     def _password_prompt(self):
@@ -951,6 +1019,58 @@ def parse_args(argv):
     return opts, cmd
 
 
+class Guarded:
+    """A Predictor that can't break the session: the first exception it
+    raises is logged, and from then on everything passes straight through,
+    starting with the server output it was holding back.  With no
+    predictor at all (--predict=never) everything passes through anyway."""
+
+    def __init__(self, pred, log=None):
+        self.pred, self.log = pred, log
+        self.leftover = b""
+
+    def _call(self, name, *args):
+        """pred.name(*args), or None if there is no predictor (any more)."""
+        if self.pred is None:
+            return None
+        held = self.pred.held
+        try:
+            return getattr(self.pred, name)(*args)
+        except Exception:
+            if self.log:
+                self.log.write(traceback.format_exc())
+                self.log.flush()
+            self.pred, self.leftover = None, held
+            return None
+
+    def _leftover(self):
+        out, self.leftover = self.leftover, b""
+        return out
+
+    def next_deadline(self, now):
+        return self._call("next_deadline", now)
+
+    def on_output(self, data, now):
+        out = self._call("on_output", data, now)
+        return self._leftover() + data if out is None else out
+
+    def filter_input(self, data, now):
+        r = self._call("filter_input", data, now)
+        return (data, self._leftover()) if r is None else r
+
+    def on_input(self, data, now):
+        return self._call("on_input", data, now) or self._leftover()
+
+    def on_tick(self, now):
+        return self._call("on_tick", now) or self._leftover()
+
+    def on_resize(self, rows, cols, now):
+        return self._call("on_resize", rows, cols, now) or self._leftover()
+
+    def finish(self):
+        return self._call("finish") or self._leftover()
+
+
 def main():
     opts, cmd = parse_args(sys.argv[1:])
     if not (os.isatty(0) and os.isatty(1)):
@@ -967,7 +1087,7 @@ def main():
 
     status = 0
     child = None
-    pred = None
+    pred = Guarded(None)
     tty.setraw(0)
     try:
         child, master = pty.fork()
@@ -986,27 +1106,10 @@ def main():
             pos = (0, 0)
 
         if opts["predict"] != "never":
-            pred = Predictor(rows, cols, mode=opts["predict"],
-                             mark=opts["mark"], log=log)
-            pred.screen.cursor.y = min(pos[0], rows - 1)
-            pred.screen.cursor.x = min(pos[1], cols - 1)
-
-        def give_up(raw):
-            """A bug in the predictor must never break the session: log it
-            and fall back to plain pass-through."""
-            nonlocal pred
-            if log:
-                import traceback
-                log.write(traceback.format_exc())
-                log.flush()
-            held, pred = pred.held, None
-            return held + raw
-
-        def guarded(fn, *args):
-            try:
-                write_all(1, fn(*args))
-            except Exception:
-                write_all(1, give_up(b""))
+            p = Predictor(rows, cols, mode=opts["predict"], mark=opts["mark"], log=log)
+            p.screen.cursor.y = min(pos[0], rows - 1)
+            p.screen.cursor.x = min(pos[1], cols - 1)
+            pred = Guarded(p, log)
 
         if leftover:
             write_all(master, leftover)
@@ -1019,8 +1122,7 @@ def main():
 
         while True:
             now = time.monotonic()
-            timeout = pred.next_deadline(now) if pred else None
-            ready, _, _ = select.select([0, master, wake_r], [], [], timeout)
+            ready, _, _ = select.select([0, master, wake_r], [], [], pred.next_deadline(now))
             now = time.monotonic()
             if wake_r in ready:
                 os.read(wake_r, 512)
@@ -1028,8 +1130,7 @@ def main():
                 resized[0] = False
                 rows, cols = get_size(1)
                 set_size(master, rows, cols)
-                if pred:
-                    guarded(pred.on_resize, rows, cols, now)
+                write_all(1, pred.on_resize(rows, cols, now))
             if master in ready:
                 try:
                     data = os.read(master, 65536)
@@ -1039,34 +1140,22 @@ def main():
                     data = b""
                 if not data:
                     break
-                if pred:
-                    try:
-                        data = pred.on_output(data, now)
-                    except Exception:
-                        data = give_up(data)
-                write_all(1, data)
+                write_all(1, pred.on_output(data, now))
             if 0 in ready:
                 data = os.read(0, 4096)
                 if not data:
                     break
-                if pred:
-                    try:
-                        data, extra = pred.filter_input(data, now)
-                    except Exception:
-                        extra = give_up(b"")
-                    write_all(1, extra)
+                data, extra = pred.filter_input(data, now)
+                write_all(1, extra)
                 if data:
                     write_all(master, data)
-                    if pred:
-                        guarded(pred.on_input, data, now)
-            if pred:
-                guarded(pred.on_tick, now)
+                    write_all(1, pred.on_input(data, now))
+            write_all(1, pred.on_tick(now))
     finally:
         try:
-            if pred is not None:
-                write_all(1, pred.finish() + pred.held)
-        except Exception:
-            pass
+            write_all(1, pred.finish())
+        except OSError:
+            pass                        # the terminal may be gone
         termios.tcsetattr(0, termios.TCSAFLUSH, saved)
         if child:
             try:
