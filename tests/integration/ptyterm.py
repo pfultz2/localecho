@@ -39,7 +39,8 @@ class Session:
             argv = ([sys.executable, localecho.__file__, "--predict=" + predict]
                     + list(extra) + ["--exec", "--"] + argv)
         environ = dict(os.environ, TERM="xterm-256color", PS1="$ ", HISTFILE="/dev/null",
-                       LANG="C.UTF-8", LC_ALL="C.UTF-8")
+                       LANG="C.UTF-8", LC_ALL="C.UTF-8",
+                       BASH_SILENCE_DEPRECATION_WARNING="1")   # macOS /bin/bash banner
         environ.update(env or {})
         pid, fd = pty.fork()
         if pid == 0:
