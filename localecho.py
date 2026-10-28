@@ -47,6 +47,7 @@ Requires: pip install pyte
 
 import errno
 import fcntl
+import functools
 import os
 import pty
 import re
@@ -64,7 +65,7 @@ try:
     from pyte import charsets as cs
     from pyte import graphics as g
     from pyte import modes as mo
-    from pyte.screens import Char, Margins, StaticDefaultDict
+    from pyte.screens import Char, Margins
     from wcwidth import wcwidth
 except ImportError:  # pragma: no cover
     sys.exit("localecho: this script needs the pyte package (pip install pyte)")
@@ -122,14 +123,12 @@ def split_safe(data):
                     end = j
     # Don't cut a UTF-8 character in half.
     k = end
-    back = 0
-    while k > 0 and back < 3 and (data[k - 1] & 0xC0) == 0x80:
+    while k > max(0, end - 3) and (data[k - 1] & 0xC0) == 0x80:
         k -= 1
-        back += 1
     if k > 0 and data[k - 1] >= 0xC0:
         lead = data[k - 1]
         need = 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
-        if back + 1 < need:
+        if end - k + 1 < need:
             end = k - 1
     return data[:end], data[end:]
 
@@ -157,34 +156,20 @@ def _color(value, named, base):
         if value in IDX_256:
             return "%d;5;%d" % (base, IDX_256[value])
         try:
-            r, gg, b = (int(value[n:n + 2], 16) for n in (0, 2, 4))
+            r, gg, b = bytes.fromhex(value)
             return "%d;2;%d;%d;%d" % (base, r, gg, b)
         except ValueError:
             return None
     return None
 
 
+SGR_FLAGS = [(name[1:], str(code)) for code, name in g.TEXT.items() if name[0] == "+"]
+
+
 def char_style(c):
     """SGR sequence that reproduces a pyte Char's attributes."""
-    parts = ["0"]
-    if c.bold:
-        parts.append("1")
-    if c.italics:
-        parts.append("3")
-    if c.underscore:
-        parts.append("4")
-    if c.blink:
-        parts.append("5")
-    if c.reverse:
-        parts.append("7")
-    if c.strikethrough:
-        parts.append("9")
-    fgc = _color(c.fg, FG_CODE, 38)
-    bgc = _color(c.bg, BG_CODE, 48)
-    if fgc:
-        parts.append(fgc)
-    if bgc:
-        parts.append(bgc)
+    parts = ["0"] + [code for attr, code in SGR_FLAGS if getattr(c, attr)]
+    parts += filter(None, (_color(c.fg, FG_CODE, 38), _color(c.bg, BG_CODE, 48)))
     return ("\x1b[" + ";".join(parts) + "m").encode()
 
 
@@ -198,22 +183,19 @@ def goto(pos):
 
 class ShadowScreen(pyte.Screen):
     def __init__(self, columns, lines):
-        self.in_alt = False
-        self._main = None
         self._alt_saved = None
         self.scroll_count = 0
-        self.region_scrolled = False
         self._last_char = ""
         super().__init__(columns, lines)
 
     def reset(self):
         super().reset()
-        self.in_alt = False
         self._main = None
         self.region_scrolled = True
 
-    def _new_buffer(self):
-        return defaultdict(lambda: StaticDefaultDict(self.default_char))
+    @property
+    def in_alt(self):
+        return self._main is not None
 
     # Alternate screen (vim, less, htop ...). pyte has no alternate buffer.
     def _alt(self, on, save):
@@ -223,13 +205,11 @@ class ShadowScreen(pyte.Screen):
             if save:
                 self._alt_saved = (self.cursor.x, self.cursor.y, self.cursor.attrs)
             self._main = self.buffer
-            self.buffer = self._new_buffer()
+            self.buffer = defaultdict(self._main.default_factory)
         else:
-            self.buffer = self._main if self._main is not None else self._new_buffer()
-            self._main = None
+            self.buffer, self._main = self._main, None
             if save and self._alt_saved:
                 self.cursor.x, self.cursor.y, self.cursor.attrs = self._alt_saved
-        self.in_alt = on
         self.dirty.update(range(self.lines))
         self.region_scrolled = True
 
@@ -255,51 +235,36 @@ class ShadowScreen(pyte.Screen):
             super().reset_mode(*modes, **kwargs)
 
     # Track scrolling so predictions can move with the text.
-    def _full_region(self):
-        top, bottom = self.margins or Margins(0, self.lines - 1)
-        return top == 0 and bottom == self.lines - 1
+    def _region(self):
+        return self.margins or Margins(0, self.lines - 1)
 
     def index(self):
-        top, bottom = self.margins or Margins(0, self.lines - 1)
+        top, bottom = self._region()
         if self.cursor.y == bottom:
-            if self._full_region():
+            if (top, bottom) == (0, self.lines - 1):
                 self.scroll_count += 1
             else:
                 self.region_scrolled = True
         super().index()
 
     def reverse_index(self):
-        top, _bottom = self.margins or Margins(0, self.lines - 1)
-        if self.cursor.y == top:
+        if self.cursor.y == self._region().top:
             self.region_scrolled = True
         super().reverse_index()
 
+    def _scroll(self, count, y, step):
+        saved, self.cursor.y = self.cursor.y, y
+        for _ in range(min(count or 1, self.lines)):
+            step()
+        self.cursor.y = saved
+
     def scroll_up(self, count=None, **kwargs):  # CSI S
-        if kwargs.get("private"):
-            return
-        count = count or 1
-        top, bottom = self.margins or Margins(0, self.lines - 1)
-        if self._full_region():
-            self.scroll_count += count
-        else:
-            self.region_scrolled = True
-        for _ in range(min(count, bottom - top + 1)):
-            for y in range(top, bottom):
-                self.buffer[y] = self.buffer[y + 1]
-            self.buffer.pop(bottom, None)
-        self.dirty.update(range(self.lines))
+        if not kwargs.get("private"):
+            self._scroll(count, self._region().bottom, self.index)
 
     def scroll_down(self, count=None, **kwargs):  # CSI T
-        if kwargs.get("private"):
-            return
-        count = count or 1
-        top, bottom = self.margins or Margins(0, self.lines - 1)
-        self.region_scrolled = True
-        for _ in range(min(count, bottom - top + 1)):
-            for y in range(bottom, top, -1):
-                self.buffer[y] = self.buffer[y - 1]
-            self.buffer.pop(top, None)
-        self.dirty.update(range(self.lines))
+        if not kwargs.get("private"):
+            self._scroll(count, self._region().top, self.reverse_index)
 
     def draw(self, data):
         if data:
@@ -331,12 +296,12 @@ class ShadowStream(pyte.ByteStream):
 def _tolerant(fn):
     """pyte raises on some unusual-but-valid sequences (e.g. extra
     parameters); ignore the sequence rather than lose the whole stream."""
+    @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
         try:
             return fn(self, *args, **kwargs)
         except (TypeError, ValueError, IndexError, KeyError):
             return None
-    wrapper.__name__ = fn.__name__
     return wrapper
 
 
@@ -355,31 +320,34 @@ class Key:
 
     cells: {(y, x): (text, sgr_bytes)} cells it changes on screen
     head:  (y, x, ch) for a typed character - the cell whose echo confirms it
-    hard:  cells that must match before the keystroke counts as processed
+    hard(pos): must this cell match before the keystroke counts as processed?
            (a typed character's own cell, or everything a backspace changes;
            text we merely guessed would shift along is not required)
     bcur/ecur: predicted cursor before / after the keystroke
     """
-    __slots__ = ("kind", "cells", "head", "hard", "bcur", "ecur", "t", "epoch")
+    __slots__ = ("kind", "cells", "bcur", "ecur", "t", "epoch")
 
-    def __init__(self, kind, cells, head, bcur, ecur, t, epoch):
-        self.kind, self.cells, self.head = kind, cells, head
+    def __init__(self, kind, cells, bcur, ecur, t, epoch):
+        self.kind, self.cells = kind, cells
         self.bcur, self.ecur, self.t, self.epoch = bcur, ecur, t, epoch
-        if kind == "char":
-            self.hard = {head[:2]}
-        elif kind == "bs":
-            self.hard = set(cells)
-        else:
-            self.hard = set()
+
+    @property
+    def head(self):
+        return self.bcur + (self.cells[self.bcur][0],) if self.kind == "char" else None
+
+    def hard(self, pos):
+        return self.kind == "bs" or pos == self.bcur
 
 
 class Predictor:
     HOLD_TIMEOUT = 0.05      # flush a partial escape sequence after this long
     HARD_TIMEOUT = 5.0       # give up on an unconfirmed prediction
     GRACE = 0.05             # wait this long for the rest of a split echo
+    DSR_TIMEOUT = 1.0        # stop waiting for an answer to our cursor query
     MAX_PEN = 32
 
     MARKS = {"underline": b"\x1b[4m", "grey": b"\x1b[90m", "none": b""}
+    MOVES = {b"\x1b[D": -1, b"\x1bOD": -1, b"\x1b[C": 1, b"\x1bOC": 1}
 
     def __init__(self, rows, cols, mode="adaptive", mark="underline", log=None):
         self.screen = ShadowScreen(cols, rows)
@@ -405,7 +373,6 @@ class Predictor:
         self.alt_pen = []
         self.fed = 0
         self.quarantine = False         # no drawing until resynced after a resize
-        self.dsr_ok = True
         self.dsr_pending = None
         self.dsr_tries = 0
         self.mismatch_since = None
@@ -418,22 +385,19 @@ class Predictor:
 
     # ---- server output ---------------------------------------------------
     def on_output(self, data, now):
-        data = self.held + data
-        self.held = b""
-        safe, rest = split_safe(data)
-        out = bytearray()
-        if safe:
-            out += self._render(hide=True)
-            out += safe
-            self._feed(safe)
-            self.unsafe = False
-        if rest:
-            self.held = rest
-            self.held_since = now
-        if safe:
-            self._evaluate(now)
-            out += self._render()
-        return bytes(out)
+        safe, self.held = split_safe(self.held + data)
+        self.held_since = now
+        if not safe:
+            return b""
+        self.unsafe = False
+        return self._emit(safe, now) + self._render()
+
+    def _emit(self, data, now):
+        """Pass server output through, with our drawing lifted off first."""
+        out = self._render(hide=True) + data
+        self._feed(data)
+        self._evaluate(now)
+        return out
 
     def _feed(self, data):
         sc = self.screen
@@ -464,7 +428,11 @@ class Predictor:
         head, tail = data[:pos + 2], data[pos + 2:]
         if NOT_SKIPPABLE_RE.search(head):
             return data
-        OUT_TOKEN_RE.sub(self._token, head)          # keep the pen up to date
+        # Keep the pen up to date. Every escape in head is an SGR, so only
+        # the ones from the last full reset on matter.
+        start = max(head.rfind(b"\x1b[0m"), head.rfind(b"\x1b[m"), 0)
+        for m in OUT_TOKEN_RE.finditer(head, start):
+            self._token(m)
         pen = b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in self.pen if b":" not in p)
         self.stream.feed(b"\r" + b"\n" * rows + pen)
         sc.region_scrolled = True
@@ -524,19 +492,17 @@ class Predictor:
             state = {}
             for i, k in enumerate(self.keys):
                 for pos, cell in k.cells.items():
-                    state[pos] = (cell[0], pos in k.hard)
+                    state[pos] = (cell[0], k.hard(pos))
                 if k.ecur == cur and all(self._cell(*pos) == text
                                          for pos, (text, hard) in state.items() if hard):
                     hit = i
             if hit is not None:
-                k = self.keys[hit]
-                chars = [k2 for k2 in self.keys[:hit + 1] if k2.kind == "char"]
-                if chars:
-                    self._confirm(max(chars, key=lambda k2: k2.epoch), now,
-                                  sample=False)
-                if k.kind == "char":
-                    self._confirm(k, now, sample=True)
+                done = self.keys[:hit + 1]
                 del self.keys[:hit + 1]
+                self.confirmed_epoch = max([self.confirmed_epoch]
+                                           + [k.epoch for k in done if k.kind == "char"])
+                if done[-1].kind == "char":
+                    self._sample_rtt(now - done[-1].t)
                 self.mismatch_since = None
             elif cur != self.keys[0].bcur:
                 # Probably wrong - but the server may have written its echo
@@ -552,7 +518,6 @@ class Predictor:
             else:
                 self.mismatch_since = None
         if not self.keys:
-            self.mismatch_since = None
             self.blocked = False
 
     def _late(self):
@@ -560,12 +525,7 @@ class Predictor:
             return 1.0
         return max(2.5 * self.srtt, self.srtt + 0.08)
 
-    def _confirm(self, k, now, sample):
-        if k.epoch > self.confirmed_epoch:
-            self.confirmed_epoch = k.epoch
-        if not sample:
-            return
-        rtt = now - k.t
+    def _sample_rtt(self, rtt):
         self.srtt = rtt if self.srtt is None else 0.875 * self.srtt + 0.125 * rtt
         if self.mode == "adaptive":
             if self.srtt > 0.030:
@@ -585,16 +545,11 @@ class Predictor:
     def _shift(self, dy):
         def mv(p):
             return (p[0] + dy, p[1])
-        for k in self.keys:
-            if min(y for y, _ in list(k.cells) + [k.bcur, k.ecur]) + dy < 0:
-                self._reset("prediction scrolled off screen")
-                return
+        if any(k.bcur[0] + dy < 0 for k in self.keys):
+            return self._reset("prediction scrolled off screen")
         for k in self.keys:
             k.cells = {mv(p): c for p, c in k.cells.items()}
             k.bcur, k.ecur = mv(k.bcur), mv(k.ecur)
-            k.hard = {mv(p) for p in k.hard}
-            if k.head:
-                k.head = (k.head[0] + dy, k.head[1], k.head[2])
         if self.input_start:
             self.input_start = mv(self.input_start)
             if self.input_start[0] < 0:
@@ -630,7 +585,6 @@ class Predictor:
                 sc.buffer[y].pop(xx, None)
             for yy in range(y + 1, sc.lines):
                 sc.buffer.pop(yy, None)
-        self.dsr_ok = True
         self.quarantine = False
         self.log("cursor resynced to %d,%d" % (y, x))
         return data, b""
@@ -649,50 +603,33 @@ class Predictor:
                     break
                 self.in_paste = False
                 i = j + 6
-                continue
-            if b == 0x1B:
+            elif b == 0x1B:
                 m = KEY_SEQ_RE.match(data, i)
-                if m:
-                    seq = m.group(0)
-                    i = m.end()
-                    if seq == b"\x1b[200~":
-                        self.in_paste = True
-                        self._barrier()
-                    elif seq in (b"\x1b[D", b"\x1bOD"):
-                        self._key_move(-1, now)
-                    elif seq in (b"\x1b[C", b"\x1bOC"):
-                        self._key_move(1, now)
-                    elif seq in (b"\x1b[I", b"\x1b[O"):
-                        pass  # focus in/out
-                    else:
-                        self._barrier()
-                    continue
-                i += 2 if i + 1 < n else 1      # lone Esc or Alt+key
-                self._barrier()
-                continue
-            if b in (0x7F, 0x08):
+                seq = m.group(0) if m else data[i:i + 2]    # lone Esc or Alt+key
+                i += len(seq)
+                if seq == b"\x1b[200~":
+                    self.in_paste = True
+                    self._barrier()
+                elif seq in self.MOVES:
+                    self._key_move(self.MOVES[seq], now)
+                elif seq not in (b"\x1b[I", b"\x1b[O"):     # focus in/out
+                    self._barrier()
+            elif b in (0x7F, 0x08):
                 self._key_backspace(now)
                 i += 1
-                continue
-            if b < 0x20:
+            elif b < 0x20:
                 self._barrier()
                 i += 1
-                continue
-            ln = 1 if b < 0x80 else 2 if b < 0xE0 else 3 if b < 0xF0 else 4
-            try:
-                ch = data[i:i + ln].decode("utf-8")
-            except UnicodeDecodeError:
-                ch = None
-            i += ln
-            if ch is None:
-                self._barrier()
             else:
-                self._key_char(ch, now)
-        out = self._render()
-        if self.quarantine and not self.dsr_ok and not self.dsr_pending \
-                and not self.held and not self.unsafe:
-            out += self._dsr_query(now)
-        return out
+                ln = 1 if b < 0x80 else 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+                try:
+                    ch = data[i:i + ln].decode("utf-8")
+                except UnicodeDecodeError:
+                    self._barrier()
+                else:
+                    self._key_char(ch, now)
+                i += ln
+        return self._render() + self._maybe_query(now)
 
     def _barrier(self):
         """A key whose effect we can't predict: stop until the server catches up."""
@@ -753,65 +690,54 @@ class Predictor:
         return b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in self.pen)
 
     def _key_char(self, ch, now):
-        if self.blocked or self.in_paste:
-            return
-        if wcwidth(ch) != 1:
-            self._barrier()
+        if self.blocked:
             return
         sc = self.screen
         y, x = self._next_cursor()
-        if x >= sc.columns - 1 or sc.cursor.x >= sc.columns:
-            self._barrier()
-            return
+        if wcwidth(ch) != 1 or x >= sc.columns - 1 or sc.cursor.x >= sc.columns:
+            return self._barrier()
         row = self._row(y)
         end = self._run_end(row, x)
         if end >= sc.columns - 1 or not self._narrow(row, x - 1, end + 1):
-            self._barrier()
-            return
+            return self._barrier()
         cells = {}
         for xx in range(end + 1, x, -1):       # insert: shift the rest right
             cells[(y, xx)] = self._as_cell(row[xx - 1])
         cells[(y, x)] = (ch, self._pen_bytes())
         if self.input_start is None or self.input_start[0] != y:
             self.input_start = (y, x)
-        self.keys.append(Key("char", cells, (y, x, ch), (y, x), (y, x + 1),
-                             now, self.epoch))
+        self.keys.append(Key("char", cells, (y, x), (y, x + 1), now, self.epoch))
+
+    def _typed(self, y, x):
+        """Is (y, x) inside the text we saw being typed (not the prompt)?"""
+        st = self.input_start
+        return st is not None and st[0] == y and x >= st[1]
 
     def _key_backspace(self, now):
-        if self.blocked or self.in_paste:
+        if self.blocked:
             return
         y, x = self._next_cursor()
-        st = self.input_start
-        # Only erase text we saw being typed, never the prompt.
-        if x == 0 or st is None or st[0] != y or x - 1 < st[1]:
-            self._barrier()
-            return
+        if not self._typed(y, x - 1):
+            return self._barrier()
         row = self._row(y)
         end = self._run_end(row, x)
         if not self._narrow(row, x - 1, end + 1):
-            self._barrier()
-            return
+            return self._barrier()
         cells = {}
         for xx in range(x - 1, max(end, x - 1) + 1):   # delete: shift left
             src = row[xx + 1] if xx + 1 <= end else (" ", self._pen_bytes())
             cells[(y, xx)] = self._as_cell(src)
-        self.keys.append(Key("bs", cells, None, (y, x), (y, x - 1), now, self.epoch))
+        self.keys.append(Key("bs", cells, (y, x), (y, x - 1), now, self.epoch))
 
     def _key_move(self, d, now):
-        if self.blocked or self.in_paste:
+        if self.blocked:
             return
         y, x = self._next_cursor()
-        st = self.input_start
         nx = x + d
-        if st is None or st[0] != y or nx < st[1] or nx >= self.screen.columns - 1:
-            self._barrier()
-            return
-        if d > 0:
-            row = self._row(y)
-            if self._run_end(row, x) < x:
-                self._barrier()          # nothing to the right to move over
-                return
-        self.keys.append(Key("mv", {}, None, (y, x), (y, nx), now, self.epoch))
+        if (not self._typed(y, nx) or nx >= self.screen.columns - 1
+                or d > 0 and self._run_end(self._row(y), x) < x):   # nothing to move over
+            return self._barrier()
+        self.keys.append(Key("mv", {}, (y, x), (y, nx), now, self.epoch))
 
     # ---- timers and resizes ----------------------------------------------
     def next_deadline(self, now):
@@ -821,7 +747,7 @@ class Predictor:
         if self.keys:
             waits.append(self.keys[0].t + self.HARD_TIMEOUT - now)
         if self.dsr_pending:
-            waits.append(self.dsr_pending[0] + 1.0 - now)
+            waits.append(self.dsr_pending[0] + self.DSR_TIMEOUT - now)
         if self.mismatch_since is not None:
             waits.append(self.mismatch_since + self.GRACE - now)
         return max(0.0, min(waits)) if waits else None
@@ -830,12 +756,9 @@ class Predictor:
         out = bytearray()
         changed = False
         if self.held and now - self.held_since >= self.HOLD_TIMEOUT:
-            out += self._render(hide=True)
-            out += self.held
-            self._feed(self.held)
-            self.held = b""
+            data, self.held = self.held, b""
+            out += self._emit(data, now)
             self.unsafe = True
-            self._evaluate(now)
             changed = True
         if self.mismatch_since is not None and now - self.mismatch_since >= self.GRACE:
             self._reset("server did something else")
@@ -843,7 +766,7 @@ class Predictor:
         if self.keys and now - self.keys[0].t >= self.HARD_TIMEOUT:
             self._reset("timed out")
             changed = True
-        if self.dsr_pending and now - self.dsr_pending[0] >= 1.0:
+        if self.dsr_pending and now - self.dsr_pending[0] >= self.DSR_TIMEOUT:
             self.dsr_pending = None
         if changed:
             out += self._render()
@@ -860,12 +783,15 @@ class Predictor:
         self.cursor_at = None
         self._reset("window resized")
         self.quarantine = True
-        self.dsr_ok = False
         self.dsr_tries = 0
         self.dsr_pending = None
-        if self.held or self.unsafe:
-            return b""          # on_input asks later
-        return self._dsr_query(now)
+        return self._maybe_query(now)
+
+    def _maybe_query(self, now):
+        """Ask where the cursor is, once the terminal is between sequences."""
+        if self.quarantine and not (self.dsr_pending or self.held or self.unsafe):
+            return self._dsr_query(now)
+        return b""
 
     def finish(self):
         return self._render(hide=True)
@@ -874,9 +800,11 @@ class Predictor:
     def _password_prompt(self):
         sc = self.screen
         y = sc.cursor.y
-        text = "".join(sc.buffer[y][x].data for x in range(min(sc.cursor.x, sc.columns)))
+        line = sc.buffer[y]
+        text = "".join(line[x].data for x in range(min(sc.cursor.x, sc.columns)))
         if y > 0:
-            text = "".join(sc.buffer[y - 1][x].data for x in range(sc.columns)) + text
+            prev = sc.buffer[y - 1]
+            text = "".join(prev[x].data for x in range(sc.columns)) + text
         return PASSWORD_RE.search(text) is not None
 
     def _can_draw(self):
@@ -903,7 +831,9 @@ class Predictor:
     def _render(self, hide=False):
         sc = self.screen
         desired, dcur = {}, None
-        if not hide and self._can_draw():
+        # _can_draw isn't free, so only ask once a trusted key could be drawn.
+        if (not hide and self.keys and self.keys[0].epoch <= self.confirmed_epoch
+                and self._can_draw()):
             for k in self.keys:
                 if k.epoch > self.confirmed_epoch:
                     break                        # not trusted yet
@@ -915,8 +845,8 @@ class Predictor:
             if pos not in desired:
                 out += self._restore_cell(pos)
                 del self.shown[pos]
-        for pos, (text, style) in desired.items():
-            want = (text, style)
+        for pos, want in desired.items():
+            text, style = want
             if self.shown.get(pos) == want:
                 continue
             if pos not in self.shown and text.strip() and self._cell(*pos) == text:
@@ -927,9 +857,7 @@ class Predictor:
         target = dcur or shadow_cur
         if out:
             out += goto(target) + self._pen_bytes()
-        elif self.cursor_at is not None and self.cursor_at != target:
-            out += goto(target)
-        elif self.cursor_at is None and target != shadow_cur:
+        elif (self.cursor_at or shadow_cur) != target:
             out += goto(target)
         else:
             return b""
@@ -943,7 +871,7 @@ class Predictor:
 
 def get_size(fd):
     try:
-        rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        cols, rows = os.get_terminal_size(fd)
     except OSError:
         rows, cols = 0, 0
     return rows or 24, cols or 80
@@ -961,8 +889,6 @@ def write_all(fd, data):
     while view:
         try:
             n = os.write(fd, view)
-        except InterruptedError:
-            continue
         except BlockingIOError:
             select.select([], [fd], [])
             continue
@@ -1044,11 +970,6 @@ def main():
     pred = None
     tty.setraw(0)
     try:
-        pos, leftover = query_cursor()
-        if pos is None:
-            write_all(1, b"\x1b[H\x1b[2J")
-            pos = (0, 0)
-
         child, master = pty.fork()
         if child == 0:
             try:
@@ -1057,6 +978,12 @@ def main():
                 os.write(2, ("localecho: %s: %s\r\n" % (cmd[0], e.strerror)).encode())
             os._exit(127)
         set_size(master, rows, cols)
+
+        # The command starts up meanwhile; its output waits in the pty.
+        pos, leftover = query_cursor()
+        if pos is None:
+            write_all(1, b"\x1b[H\x1b[2J")
+            pos = (0, 0)
 
         if opts["predict"] != "never":
             pred = Predictor(rows, cols, mode=opts["predict"],
@@ -1072,9 +999,14 @@ def main():
                 import traceback
                 log.write(traceback.format_exc())
                 log.flush()
-            held = pred.held if pred else b""
-            pred = None
+            held, pred = pred.held, None
             return held + raw
+
+        def guarded(fn, *args):
+            try:
+                write_all(1, fn(*args))
+            except Exception:
+                write_all(1, give_up(b""))
 
         if leftover:
             write_all(master, leftover)
@@ -1088,10 +1020,7 @@ def main():
         while True:
             now = time.monotonic()
             timeout = pred.next_deadline(now) if pred else None
-            try:
-                ready, _, _ = select.select([0, master, wake_r], [], [], timeout)
-            except InterruptedError:
-                ready = []
+            ready, _, _ = select.select([0, master, wake_r], [], [], timeout)
             now = time.monotonic()
             if wake_r in ready:
                 os.read(wake_r, 512)
@@ -1100,10 +1029,7 @@ def main():
                 rows, cols = get_size(1)
                 set_size(master, rows, cols)
                 if pred:
-                    try:
-                        write_all(1, pred.on_resize(rows, cols, now))
-                    except Exception:
-                        write_all(1, give_up(b""))
+                    guarded(pred.on_resize, rows, cols, now)
             if master in ready:
                 try:
                     data = os.read(master, 65536)
@@ -1132,15 +1058,9 @@ def main():
                 if data:
                     write_all(master, data)
                     if pred:
-                        try:
-                            write_all(1, pred.on_input(data, now))
-                        except Exception:
-                            write_all(1, give_up(b""))
+                        guarded(pred.on_input, data, now)
             if pred:
-                try:
-                    write_all(1, pred.on_tick(now))
-                except Exception:
-                    write_all(1, give_up(b""))
+                guarded(pred.on_tick, now)
     finally:
         try:
             if pred is not None:
