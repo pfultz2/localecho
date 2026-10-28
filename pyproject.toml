@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localecho"
+version = "0.1.0"
+description = "Run ssh with mosh-style predictive local echo"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = ["pyte>=0.8", "wcwidth"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+localecho = "localecho:main"
+
+[tool.setuptools]
+py-modules = ["localecho"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+markers = [
+    "integration: end-to-end tests that run a real shell in a pseudo-terminal (slower, POSIX only)",
+]
