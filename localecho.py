@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""localecho.py - run ssh with mosh-style predictive local echo.
+"""localecho.py - run a command with mosh-style predictive local echo.
 
 Usage:
-    localecho.py [options] [ssh arguments...]
-    localecho.py [options] --exec -- command [args...]
+    localecho.py [options] command [args...]
 
-Options (must come before the ssh arguments):
+    localecho.py ssh user@host
+    localecho.py --mark=grey et host
+
+Options (must come before the command):
     --predict=MODE   adaptive (default): show predictions only when the
                      measured round trip is above ~30 ms.
                      always: show predictions whenever they are trusted.
@@ -14,21 +16,24 @@ Options (must come before the ssh arguments):
                      underline (default), grey, or none.  Once the echo
                      arrives the character is redrawn normally.
     --debug=FILE     append a log of prediction decisions to FILE.
-    --exec           treat the remaining arguments as the whole command to
-                     run instead of arguments to ssh (useful for testing).
+
+Any interactive client whose echo comes back over a slow link can be
+wrapped: ssh, et, docker or kubectl exec -it, telnet, a serial console.
+There is no point wrapping mosh, which already predicts on its own.
 
 How it works
 ------------
-ssh runs inside a pseudo-terminal, and everything it prints is passed
+The command runs inside a pseudo-terminal, and everything it prints is passed
 straight through to your terminal, so scrollback, colours, mouse support and
-so on behave exactly as with plain ssh.  The same output is also fed to a
+so on behave exactly as without localecho.  The same output is also fed to a
 pyte terminal emulator, which keeps a "shadow" copy of what your screen
 looks like.
 
-When you type, the keystroke is sent to ssh immediately and a guess at its
-effect (the character appearing at the cursor, the rest of the line shifting
-right, the cursor moving) is drawn on your screen straight away.  When the
-server's echo arrives, the guess is checked against the shadow screen.
+When you type, the keystroke is sent to the command immediately and a guess
+at its effect (the character appearing at the cursor, the rest of the line
+shifting right, the cursor moving) is drawn on your screen straight away.
+When the server's echo arrives, the guess is checked against the shadow
+screen.
 
 Like mosh, a guess is only *shown* once an earlier guess in the same
 "epoch" has been confirmed by the server.  Pressing Enter, Tab, a control
@@ -985,7 +990,7 @@ def query_cursor(timeout=1.0):
 
 
 def parse_args(argv):
-    opts = {"predict": "adaptive", "mark": "underline", "debug": None, "exec": False}
+    opts = {"predict": "adaptive", "mark": "underline", "debug": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1002,25 +1007,21 @@ def parse_args(argv):
         elif a.startswith("--debug="):
             opts["debug"] = a.split("=", 1)[1]
         elif a == "--exec":
-            opts["exec"] = True
+            pass                        # needed when ssh was implied; kept for old scripts
         elif a == "--":
             i += 1
             break
         elif a in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
+        elif a.startswith("-"):
+            sys.exit("localecho: unknown option %s (options go before the command, see --help)" % a)
         else:
             break
         i += 1
-    rest = argv[i:]
-    if opts["exec"]:
-        if not rest:
-            sys.exit("localecho: --exec needs a command")
-        cmd = rest
-    else:
-        if not rest:
-            sys.exit("usage: localecho.py [options] [ssh arguments...]  (see --help)")
-        cmd = ["ssh"] + rest
+    cmd = argv[i:]
+    if not cmd:
+        sys.exit("usage: localecho.py [options] command [args...]  (see --help)")
     return opts, cmd
 
 

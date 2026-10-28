@@ -1,16 +1,20 @@
 # localecho
 
-Run `ssh` with mosh-style predictive local echo. Typed characters appear
-immediately (underlined or grey until the server echoes them back) while the
-session itself stays a normal ssh session.
+Run `ssh`, `et` or any other interactive command with mosh-style predictive
+local echo. Typed characters appear immediately (underlined or grey until the
+server echoes them back) while the session itself stays a normal session of
+that command.
 
 ```
 pip install .
-localecho user@host
-localecho --mark=grey user@host
+localecho ssh user@host
+localecho --mark=grey et user@host
+localecho kubectl exec -it mypod -- bash
 ```
 
-See `localecho --help` for all options.
+localecho's own options go before the command; everything from the command
+on is passed to it unchanged. There is no point wrapping `mosh`, which already
+predicts on its own. See `localecho --help` for all options.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 """A scripted user at a terminal, for end-to-end tests.
 
-Session starts `localecho --exec -- lagpty.py DELAY <cmd>` in a pseudo-terminal
+Session starts `localecho -- lagpty.py DELAY <cmd>` in a pseudo-terminal
 and plays the user's terminal emulator: it answers cursor-position queries,
 keeps the screen in a pyte emulator, and lets tests type keys and look at
 the screen.
@@ -37,7 +37,7 @@ class Session:
         argv = [sys.executable, LAGPTY, str(delay)] + list(cmd)
         if predict != "none":
             argv = ([sys.executable, localecho.__file__, "--predict=" + predict]
-                    + list(extra) + ["--exec", "--"] + argv)
+                    + list(extra) + ["--"] + argv)
         environ = dict(os.environ, TERM="xterm-256color", PS1="$ ", HISTFILE="/dev/null",
                        LANG="C.UTF-8", LC_ALL="C.UTF-8",
                        BASH_SILENCE_DEPRECATION_WARNING="1")   # macOS /bin/bash banner
