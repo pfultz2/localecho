@@ -1,8 +1,8 @@
 """Output parsing: partial sequences, pen tracking, sanitising."""
 import pytest
 
-from localecho import (MAX_PEN, Guarded, Predictor, ShadowScreen, ShadowStream, char_style,
-                       sgr_resets, split_safe)
+from localecho import (MAX_PEN, Predictor, ShadowScreen, ShadowStream, char_style, sgr_resets,
+                       split_safe)
 from pyte.screens import Char
 
 
@@ -108,10 +108,8 @@ def test_sgr_resets(params, resets):
     b"\x01\x1a",          # controls that terminals ignore
 ])
 def test_unusual_sequences_do_not_disturb_the_shadow(seq):
-    g = Guarded(Predictor(24, 80))
-    g.on_output(b"ab" + seq + b"cd", 0.0)
-    p = g.pred
-    assert p is not None
+    p = Predictor(24, 80)
+    p.on_output(b"ab" + seq + b"cd", 0.0)
     assert p.screen.display[0].rstrip() == "abcd"
     assert p.screen.cursor.x == 4 and p.screen.columns == 80
 

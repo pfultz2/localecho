@@ -211,9 +211,9 @@ def test_a_string_sequence_never_finished_is_given_up_on(rig):
     rig.tick(1.0)
     assert rig.p.held == b"\x1bP"
     rig.tick(rig.p.STRING_TIMEOUT - 3.9)     # counted from its start, as in tmux
-    assert rig.p.held == b"" and rig.p.quarantine and rig.p.dsr_pending
-    y, x = rig.cursor()
-    assert rig.p.filter_input(b"\x1b[%d;%dR" % (y + 1, x + 1), rig.now) == (b"", b"")
+    assert rig.p.held == b"" and rig.p.quarantine
+    assert rig.answer() == b""
+    assert not rig.p.quarantine
     rig.type("e")
     rig.server(b"e")
     rig.type("c")
@@ -251,11 +251,10 @@ def test_resize_takes_drawn_predictions_off_first(rig, rows, scrolled):
     # line in view by scrolling.
     rig.term.resize(rows, 80)
     rig.term_stream.feed(rig.p.on_resize(rows, 80, rig.now))
-    y, x = rig.cursor()
-    assert (rig.line(), y, x) == ("$ e", 23 - scrolled, 3)
+    y = 23 - scrolled
+    assert (rig.line(), rig.cursor()) == ("$ e", (y, 3))
     assert not any(rig.cell(x).underscore for x in range(6))
-    data, _ = rig.p.filter_input(b"\x1b[%d;%dR" % (y + 1, x + 1), rig.now)
-    assert data == b""
+    assert rig.answer() == b""
     rig.server(b"ch")
     assert rig.line() == "$ ech" and rig.cursor() == (y, 5)
     assert rig.term.display == rig.p.screen.display

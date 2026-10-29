@@ -81,16 +81,18 @@ except ImportError:  # pragma: no cover
 # Escape-sequence helpers
 # --------------------------------------------------------------------------
 
+# A DCS so far, after its ESC.  Only ST ends it: tmux passes the sequences
+# inside it on with each ESC doubled.
+DCS = rb"P[^\x1b]*(?:\x1b[^\\][^\x1b]*)*"
 # One escape sequence in terminal output, as far as the terminal's parser
-# is concerned.  A CAN, SUB or ESC cuts any sequence short (the ESC starts
-# a new one), except that a DCS ends only with ST: tmux passes the
-# sequences inside it on with each ESC doubled.  Groups: csi and final for
-# a CSI (no final byte if it was cut short), str for a string sequence
-# (OSC, DCS, APC, PM, SOS), esc for the final byte of any other sequence.
+# is concerned.  Apart from a DCS, a CAN, SUB or ESC cuts any sequence
+# short (the ESC starts a new one).  Groups: csi and final for a CSI (no
+# final byte if it was cut short), str for a string sequence (OSC, DCS,
+# APC, PM, SOS), esc for the final byte of any other sequence.
 OUT_TOKEN_RE = re.compile(
     rb"\x1b(?:"
     rb"\[(?P<csi>[^\x18\x1a\x1b\x40-\x7e]*)(?P<final>[\x40-\x7e]|(?=[\x18\x1a\x1b]))"
-    rb"|(?P<str>P[^\x1b]*(?:\x1b[^\\][^\x1b]*)*\x1b\\"
+    rb"|(?P<str>" + DCS + rb"\x1b\\"
     rb"|\][^\x07\x18\x1a\x1b]*(?:\x07|(?=[\x18\x1a\x1b]))"
     rb"|[_^X][^\x18\x1a\x1b]*(?=[\x18\x1a\x1b]))"
     rb"|(?![\[\]P_^X])[\x20-\x2f]*(?:(?P<esc>[\x30-\x7e])|(?=[^\x20-\x7e])))"
@@ -100,7 +102,7 @@ OUT_TOKEN_RE = re.compile(
 COMPLETE_RE = re.compile(
     rb"(?:[^\x1b]+|" + re.sub(rb"\(\?P<\w+>", b"(?:", OUT_TOKEN_RE.pattern) + rb")*")
 STRING_KINDS = (b"P", b"]", b"_", b"^", b"X")     # DCS, OSC, APC, PM, SOS
-DCS_OPEN_RE = re.compile(rb"\x1bP[^\x1b]*(?:\x1b[^\\][^\x1b]*)*")
+DCS_OPEN_RE = re.compile(rb"\x1b" + DCS)
 CSI_BODY_RE = re.compile(rb"([\x30-\x3f]*)([\x20-\x2f]*)")
 # Controls that terminals ignore, but that make pyte drop the rest of the text.
 IGNORED_C0_RE = re.compile(rb"[\x00-\x06\x10-\x1a\x1c-\x1f]")
@@ -224,6 +226,7 @@ def sgr_resets(params):
 # --------------------------------------------------------------------------
 
 MAX_PEN = 32        # SGRs to replay before falling back to pyte's attributes
+PYTE_ERRORS = (TypeError, ValueError, IndexError, KeyError)   # on sequences it can't handle
 
 
 class PenCursor(Cursor):
@@ -427,10 +430,11 @@ class ShadowStream(pyte.ByteStream):
 
     def _send_to_parser(self, data):
         # pyte's parser itself raises on a few things, such as a digit
-        # other than 0-9 in a CSI.  It starts afresh; drop the sequence.
+        # other than 0-9 in a CSI.  Drop the sequence and start afresh.
         try:
-            return super()._send_to_parser(data)
-        except (TypeError, ValueError, IndexError, KeyError):
+            return self._parser.send(data)
+        except PYTE_ERRORS:
+            self._initialize_parser()
             return True
 
     def select_other_charset(self, code):
@@ -444,7 +448,7 @@ def _tolerant(fn):
     def wrapper(self, *args, **kwargs):
         try:
             return fn(self, *args, **kwargs)
-        except (TypeError, ValueError, IndexError, KeyError):
+        except PYTE_ERRORS:
             return None
     return wrapper
 
@@ -493,12 +497,12 @@ class Predictor:
     MARKS = {"underline": b"\x1b[4m", "grey": b"\x1b[90m", "none": b""}
     MOVES = {b"\x1b[D": -1, b"\x1bOD": -1, b"\x1b[C": 1, b"\x1bOC": 1}
 
-    def __init__(self, rows, cols, mode="adaptive", mark="underline", log=None):
+    def __init__(self, rows, cols, mode="adaptive", mark="underline"):
         self.screen = ShadowScreen(cols, rows)
         self.stream = ShadowStream(self.screen)
         self.mode = mode
         self.mark = self.MARKS[mark]
-        self.log_file = log
+        self.messages = None     # where log() puts what it has to say, if anywhere
         self.keys = []
         self.epoch = 1
         self.confirmed_epoch = 0
@@ -513,9 +517,8 @@ class Predictor:
         self.held = b""          # output the terminal is in the middle of
         self.string_since = None        # when the string sequence in held started
         self.fed = 0
-        self.quarantine = False         # no drawing until resynced after a resize
-        self.dsr_pending = None         # (sent, fed then) for the query we wait on
-        self.dsr_sent = []              # when queries still to be answered were sent
+        self.quarantine = False         # lost track: no drawing until resynced
+        self.dsr_sent = []              # (when, fed then) of cursor queries not yet answered
         self.dsr_tries = 0
         self.mismatch_since = None
         self.block = None        # (fed, candidates) for the cursor the application draws
@@ -523,9 +526,9 @@ class Predictor:
 
     # ---- logging ---------------------------------------------------------
     def log(self, msg):
-        if self.log_file:
-            self.log_file.write("%.3f %s\n" % (time.monotonic(), msg))
-            self.log_file.flush()
+        """Note msg for the --debug log, which main writes out."""
+        if self.messages is not None:
+            self.messages.append(msg)
 
     # ---- server output ---------------------------------------------------
     def on_output(self, data, now):
@@ -533,7 +536,7 @@ class Predictor:
 
         The shadow screen gets only complete sequences; while the terminal
         is in the middle of one, we draw nothing."""
-        out = self._render(hide=True) + data
+        out = self._hide() + data
         safe, self.held = split_safe(self.held + data)
         if self.held[1:2] not in STRING_KINDS:
             self.string_since = None
@@ -600,24 +603,27 @@ class Predictor:
             p = CSI_BODY_RE.fullmatch(bytes(c for c in body if c >= 0x20))
         if p is None or not final:          # (or it was cut short)
             return ctl
-        params, inter = p.groups()
-        seq = b"\x1b[" + params + inter + final
+        return ctl + self._csi(*p.groups(), final)
+
+    @staticmethod
+    def _csi(params, inter, final):
+        """A well-formed CSI sequence as pyte should get it."""
         if final == b"m" and not inter and params[:1] not in (b"<", b"=", b">", b"?"):
             if b":" in params:
                 # pyte can't parse sub-parameters (4:3 is undercurl), so send
                 # the raw bytes on to the screen's pen as a private SGR, which
                 # keeps them in order with everything else.
-                return ctl + b"\x1b[?" + b";".join(b"%d" % c for c in params) + b"m"
-            return ctl + seq
+                return b"\x1b[?" + b";".join(b"%d" % c for c in params) + b"m"
+            return b"\x1b[" + params + final
         if params[:1] == b"?" and final not in b"hlJK":
-            return ctl                      # private sequences pyte doesn't know
+            return b""                      # private sequences pyte doesn't know
         if inter or params[:1] in (b"<", b"=", b">"):
             if inter == b"!" and final == b"p":   # DECSTR soft reset
-                return ctl + b"\x1b[m"
-            return ctl
+                return b"\x1b[m"
+            return b""
         if b":" in params:
-            return ctl
-        return ctl + seq
+            return b""
+        return b"\x1b[" + params + final
 
     def _cell(self, y, x):
         return self.screen.buffer[y][x].data
@@ -682,7 +688,7 @@ class Predictor:
                 # in several pieces, so give the rest a moment to arrive.
                 if self.mismatch_since is None:
                     self.mismatch_since = now
-                    if self.log_file:
+                    if self.messages is not None:
                         y = (cur or self.keys[0].bcur)[0]
                         self.log("mismatch: cursor=%s row=%r keys=%s" % (
                             cur, "".join(self._cell(y, x) for x in range(min(sc.columns, 40))),
@@ -736,24 +742,22 @@ class Predictor:
         see either.
 
         Returns (data to forward, bytes to write to the terminal)."""
-        self.dsr_sent = [t for t in self.dsr_sent if now - t < self.DSR_FORGET]
+        self.dsr_sent = [q for q in self.dsr_sent if now - q[0] < self.DSR_FORGET]
         out = b""
         while self.dsr_sent:
             m = CPR_RE.search(data)
             if not m:
                 break
             data = data[:m.start()] + data[m.end():]
-            self.dsr_sent.pop(0)
+            _t, fed_then = self.dsr_sent.pop(0)
             if not self.dsr_sent:           # the answer to the latest query
-                if self.dsr_pending:
-                    out = self._resync(m, now)
+                if self.quarantine:
+                    out = self._resync(m, fed_then, now)
                 break
         return data, out
 
-    def _resync(self, m, now):
+    def _resync(self, m, fed_then, now):
         """Take the terminal's answer m to our cursor-position query."""
-        _t, fed_then = self.dsr_pending
-        self.dsr_pending = None
         if fed_then != self.fed:
             # Output arrived in between, so the answer may be stale; ask again.
             self.dsr_tries += 1
@@ -778,9 +782,13 @@ class Predictor:
         return b""
 
     def _dsr_query(self, now):
-        self.dsr_pending = (now, self.fed)
-        self.dsr_sent.append(now)
+        self.query_sent(now)
         return b"\x1b[6n"
+
+    def query_sent(self, now):
+        """A cursor-position query went to the terminal (main sends one
+        at startup): its answer must not reach the remote side."""
+        self.dsr_sent.append((now, self.fed))
 
     def on_input(self, data, now):
         data, self.paste_tail = self.paste_tail + data, b""
@@ -963,8 +971,6 @@ class Predictor:
         waits = []
         if self.keys:
             waits.append(self.keys[0].t + self.HARD_TIMEOUT - now)
-        if self.dsr_pending:
-            waits.append(self.dsr_pending[0] + self.DSR_TIMEOUT - now)
         if self.mismatch_since is not None:
             waits.append(self.mismatch_since + self.GRACE - now)
         if self.string_since is not None:
@@ -986,17 +992,13 @@ class Predictor:
         if self.keys and now - self.keys[0].t >= self.HARD_TIMEOUT:
             self._reset("timed out")
             changed = True
-        if self.dsr_pending and now - self.dsr_pending[0] >= self.DSR_TIMEOUT:
-            self.dsr_pending = None
         return out + (self._render() if changed else b"")
 
     def on_resize(self, rows, cols, now):
         # The terminal has already resized, so take our drawing off with
-        # moves relative to the cursor, and forget it.  Otherwise the cursor
-        # position we ask for below would be where we left the real cursor.
-        out = self.lift()
-        self.shown.clear()
-        self.cursor_at = None
+        # moves relative to the cursor.  Otherwise the cursor position we
+        # ask for below would be where we left the real cursor.
+        out = self._hide(relative=True)
         sc = self.screen
         sc.resize(rows, cols)
         sc.cursor.x = min(sc.cursor.x, cols - 1)
@@ -1010,18 +1012,20 @@ class Predictor:
         self._reset(why)
         self.quarantine = True
         self.dsr_tries = 0
-        self.dsr_pending = None
-        return self._maybe_query(now)
+        # Answers to anything asked before this are out of date: ask again.
+        return b"" if self.held else self._dsr_query(now)
 
     def _maybe_query(self, now):
-        """Ask where the cursor is, once the terminal is between sequences."""
-        if self.quarantine and not (self.dsr_pending or self.held):
+        """Ask where the cursor is, once the terminal is between sequences,
+        unless we are still waiting for an answer."""
+        waiting = self.dsr_sent and now - self.dsr_sent[-1][0] < self.DSR_TIMEOUT
+        if self.quarantine and not (waiting or self.held):
             return self._dsr_query(now)
         return b""
 
     def finish(self):
         """Take our drawing off the screen."""
-        return self._render(hide=True)
+        return self._hide()
 
     # ---- drawing ----------------------------------------------------------
     def _password_prompt(self, cur):
@@ -1063,38 +1067,48 @@ class Predictor:
         start, data, _ = self._redraw(pos)
         return goto(start) + data
 
-    def lift(self):
+    def lift(self, relative=False):
         """Bytes that take our drawing off the screen and give the real
         terminal back the server's cursor and pen, without changing
         anything here.
 
-        Unlike _render(hide=True), every move is relative to where we left
-        the real cursor, so this still works after the terminal has resized
-        and scrolled or rewrapped the screen: the text on the cursor's line
+        With relative, every move is relative to where we left the real
+        cursor, so this still works after the terminal has resized and
+        scrolled or rewrapped the screen: the text on the cursor's line
         keeps its place relative to the cursor."""
         sc = self.screen
+        cols = sc.columns
         server = (sc.cursor.y, sc.cursor.x)
         at = self.cursor_at or server
         if not self.shown and at == server:
             return b""
+        cells = [self._redraw(pos) for pos in sorted(self.shown)]
+        if server[1] >= cols:
+            # Pending autowrap: rewriting the last cell is the only way to
+            # put the terminal back in that state.
+            cells.append(self._redraw((server[0], cols - 1)))
         out = bytearray()
-        for pos in sorted(self.shown):
-            start, data, end = self._redraw(pos)
-            out += move(at, start, sc.columns) + data
+        for start, data, end in cells:
+            out += (move(at, start, cols) if relative else goto(start)) + data
             at = end
-        if server[1] >= sc.columns:
-            # Pending autowrap: rewrite the last cell, as _render does.
-            start, data, _ = self._redraw((server[0], sc.columns - 1))
-            out += move(at, start, sc.columns) + data
-        else:
-            out += move(at, server, sc.columns)
-        return bytes(out) + self._pen_bytes()
+        if server[1] < cols:
+            out += move(at, server, cols) if relative else goto(server)
+        if cells:
+            out += self._pen_bytes()
+        return bytes(out)
 
-    def _render(self, hide=False):
+    def _hide(self, relative=False):
+        """Take our drawing off the screen, and forget it."""
+        out = self.lift(relative)
+        self.shown.clear()
+        self.cursor_at = None
+        return out
+
+    def _render(self):
         sc = self.screen
         desired, dcur = {}, None
         # _can_draw isn't free, so only ask once a trusted key could be drawn.
-        if (not hide and self.keys and self.keys[0].epoch <= self.confirmed_epoch
+        if (self.keys and self.keys[0].epoch <= self.confirmed_epoch
                 and self._can_draw()):
             for k in self.keys:
                 if k.epoch > self.confirmed_epoch:
@@ -1230,27 +1244,38 @@ class Guarded:
 
     def __init__(self, pred, log=None):
         self.pred, self.log = pred, log
-        self.leftover = b""
+        self.cleanup = b""
+        # What is to go in the log file (the predictor does no I/O itself).
+        self.messages = [] if log else None
+        if pred is not None:
+            pred.messages = self.messages
+
+    def write_log(self, now):
+        """Write out what was logged since last time, stamped with `now`."""
+        if self.messages:
+            self.log.write("".join("%.3f %s\n" % (now, m) for m in self.messages))
+            self.log.flush()
+            self.messages.clear()
 
     def _call(self, name, *args):
         """pred.name(*args), or None if there is no predictor (any more)."""
         if self.pred is None:
             return None
         # What would clean up after the predictor, worked out before the
-        # call: a failing call may have changed its state half way.
+        # call: a failing call may have changed its state half way.  (With
+        # relative moves, in case the terminal has just been resized.)
         lift = b""
         try:
-            lift = self.pred.lift()
+            lift = self.pred.lift(relative=True)
             return getattr(self.pred, name)(*args)
         except Exception:
-            if self.log:
-                self.log.write(traceback.format_exc())
-                self.log.flush()
-            self.pred, self.leftover = None, lift
+            if self.messages is not None:
+                self.messages.append(traceback.format_exc().rstrip())
+            self.pred, self.cleanup = None, lift
             return None
 
-    def _leftover(self):
-        out, self.leftover = self.leftover, b""
+    def _cleanup(self):
+        out, self.cleanup = self.cleanup, b""
         return out
 
     def next_deadline(self, now):
@@ -1258,23 +1283,23 @@ class Guarded:
 
     def on_output(self, data, now):
         out = self._call("on_output", data, now)
-        return self._leftover() + data if out is None else out
+        return self._cleanup() + data if out is None else out
 
     def filter_input(self, data, now):
         r = self._call("filter_input", data, now)
-        return (data, self._leftover()) if r is None else r
+        return (data, self._cleanup()) if r is None else r
 
     def on_input(self, data, now):
-        return self._call("on_input", data, now) or self._leftover()
+        return self._call("on_input", data, now) or self._cleanup()
 
     def on_tick(self, now):
-        return self._call("on_tick", now) or self._leftover()
+        return self._call("on_tick", now) or self._cleanup()
 
     def on_resize(self, rows, cols, now):
-        return self._call("on_resize", rows, cols, now) or self._leftover()
+        return self._call("on_resize", rows, cols, now) or self._cleanup()
 
     def finish(self):
-        return self._call("finish") or self._leftover()
+        return self._call("finish") or self._cleanup()
 
 
 def main():
@@ -1309,11 +1334,11 @@ def main():
         if opts["predict"] != "never":
             # The command starts up meanwhile; its output waits in the pty.
             pos, leftover = query_cursor()
-            p = Predictor(rows, cols, mode=opts["predict"], mark=opts["mark"], log=log)
+            p = Predictor(rows, cols, mode=opts["predict"], mark=opts["mark"])
             if pos is None:
                 write_all(1, b"\x1b[H\x1b[2J")
                 pos = (0, 0)
-                p.dsr_sent.append(time.monotonic())     # the answer may come yet
+                p.query_sent(time.monotonic())          # the answer may come yet
             p.screen.cursor.y = min(pos[0], rows - 1)
             p.screen.cursor.x = min(pos[1], cols - 1)
             pred = Guarded(p, log)
@@ -1370,11 +1395,16 @@ def main():
                 except BlockingIOError:
                     pass
             write_all(1, pred.on_tick(now))
+            pred.write_log(now)
     finally:
         try:
             write_all(1, pred.finish())
         except OSError:
             pass                        # the terminal may be gone
+        try:
+            pred.write_log(time.monotonic())
+        except OSError:
+            pass                        # and so may the log
         try:
             termios.tcsetattr(0, termios.TCSAFLUSH, saved)
         except termios.error:

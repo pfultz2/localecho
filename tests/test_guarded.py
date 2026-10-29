@@ -58,8 +58,22 @@ def test_after_a_failure_everything_passes_through():
 
 def test_failures_are_logged():
     log = io.StringIO()
-    Guarded(breaking(Predictor(24, 80), "on_tick"), log).on_tick(0.0)
+    g = Guarded(breaking(Predictor(24, 80), "on_tick"), log)
+    g.on_tick(0.0)
+    g.write_log(1.5)
+    assert log.getvalue().startswith("1.500 Traceback")
     assert "Boom: on_tick" in log.getvalue()
+
+
+def test_the_predictor_does_no_logging_of_its_own(make_rig):
+    log = io.StringIO()
+    rig = make_rig()
+    rig.p = Guarded(rig.p, log)
+    rig.confident()
+    rig.type("\r")                          # a barrier, which is logged ...
+    assert log.getvalue() == ""             # ... but not written yet
+    rig.p.write_log(rig.now)
+    assert log.getvalue() == "%.3f barrier: key b'\\r' (input from (0, 2))\n" % rig.now
 
 
 def test_without_a_predictor_everything_passes_through():

@@ -10,7 +10,6 @@ import shutil
 import signal
 import sys
 import threading
-import time
 
 import pytest
 
@@ -161,18 +160,9 @@ def test_leaving_early_ends_the_command_too(sessions, how):
     if how == "sigterm":
         os.kill(s.pid, signal.SIGTERM)
     else:
-        fd, s.fd = s.fd, -1
-        os.close(fd)                          # the terminal window is closed
-    for _ in range(100):
-        pid, status = os.waitpid(s.pid, os.WNOHANG)
-        if pid:
-            s.pid = None
-            break
-        time.sleep(0.05)
-    else:
-        pytest.fail("localecho is still waiting for the command")
-    assert os.waitstatus_to_exitcode(status) == 128 + (signal.SIGTERM if how == "sigterm"
-                                                       else signal.SIGHUP)
+        s.hang_up()
+    sig = signal.SIGTERM if how == "sigterm" else signal.SIGHUP
+    assert s.wait_exit(timeout=5) == 128 + sig
 
 
 @pytest.mark.skipif(shutil.which("vim") is None, reason="needs vim")

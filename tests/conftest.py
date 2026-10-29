@@ -3,6 +3,14 @@ import pytest
 from localecho import Predictor, ShadowScreen, ShadowStream
 
 
+class Terminal(ShadowScreen):
+    """The user's terminal, which answers queries such as ESC [ 6 n."""
+    answers = b""
+
+    def write_process_input(self, data):
+        self.answers += data.encode()
+
+
 class Rig:
     """Drives a Predictor directly, without any processes.
 
@@ -13,7 +21,7 @@ class Rig:
 
     def __init__(self, rows=24, cols=80, mark="underline", mode="always"):
         self.p = Predictor(rows, cols, mode=mode, mark=mark)
-        self.term = ShadowScreen(cols, rows)
+        self.term = Terminal(cols, rows)
         self.term_stream = ShadowStream(self.term)
         self.now = 100.0
 
@@ -32,6 +40,14 @@ class Rig:
     def tick(self, dt):
         self.now += dt
         self.term_stream.feed(self.p.on_tick(self.now))
+
+    def answer(self):
+        """The terminal's answers to queries arrive as typed input.
+        Returns what is passed on to the server."""
+        data, self.term.answers = self.term.answers, b""
+        data, extra = self.p.filter_input(data, self.now)
+        self.term_stream.feed(extra)
+        return data
 
     def line(self, y=None):
         if y is None:

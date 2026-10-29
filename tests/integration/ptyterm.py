@@ -55,6 +55,9 @@ class Session:
 
     def pump(self, secs):
         """Let the session run for `secs`, updating the screen."""
+        if self.fd < 0:                     # hung up
+            time.sleep(secs)
+            return
         end = time.monotonic() + secs
         while True:
             left = end - time.monotonic()
@@ -84,6 +87,11 @@ class Session:
                 return True
             self.pump(0.05)
         return False
+
+    def hang_up(self):
+        """Close the terminal window."""
+        fd, self.fd = self.fd, -1
+        os.close(fd)
 
     def line(self, y=None):
         return self.screen.display[self.screen.cursor.y if y is None else y].rstrip()
