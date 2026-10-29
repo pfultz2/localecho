@@ -7,7 +7,10 @@ arrive, so whatever is on screen then was drawn by localecho.
 """
 import os
 import shutil
+import signal
 import sys
+import threading
+import time
 
 import pytest
 
@@ -30,7 +33,8 @@ def sessions():
     started = []
 
     def start(**kwargs):
-        s = Session(delay=DELAY, **kwargs)
+        kwargs.setdefault("delay", DELAY)
+        s = Session(**kwargs)
         started.append(s)
         return s
     yield start
@@ -127,6 +131,48 @@ def test_bulk_output_then_typing(sessions):
 def test_exit_code_is_passed_through(sessions):
     s = sessions(cmd=["bash", "-c", "exit 7"])
     assert s.wait_exit() == 7
+
+
+# Prints eight bytes for every byte it reads, so it soon blocks until its
+# output is read.
+CHATTY = """\
+import os, tty
+tty.setraw(0)
+n = 0
+while n < 20000:
+    d = os.read(0, 1024)
+    n += len(d)
+    os.write(1, d * 8)
+os.write(1, b"\\r\\nread %d\\r\\n" % n)
+"""
+
+
+def test_big_paste_into_a_program_that_prints_a_lot(sessions):
+    s = sessions(cmd=[sys.executable, "-c", CHATTY], delay=None)
+    s.pump(1.0)
+    threading.Thread(target=s.send, args=(b"x" * 20000,), daemon=True).start()
+    assert s.wait_for("read 20000", timeout=20)
+
+
+@pytest.mark.parametrize("how", ["sigterm", "hangup"])
+def test_leaving_early_ends_the_command_too(sessions, how):
+    s = sessions(cmd=["cat"])
+    s.pump(1.0)
+    if how == "sigterm":
+        os.kill(s.pid, signal.SIGTERM)
+    else:
+        fd, s.fd = s.fd, -1
+        os.close(fd)                          # the terminal window is closed
+    for _ in range(100):
+        pid, status = os.waitpid(s.pid, os.WNOHANG)
+        if pid:
+            s.pid = None
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("localecho is still waiting for the command")
+    assert os.waitstatus_to_exitcode(status) == 128 + (signal.SIGTERM if how == "sigterm"
+                                                       else signal.SIGHUP)
 
 
 @pytest.mark.skipif(shutil.which("vim") is None, reason="needs vim")

@@ -1,7 +1,8 @@
-"""Output parsing: holding back partial sequences, pen tracking, sanitising."""
+"""Output parsing: partial sequences, pen tracking, sanitising."""
 import pytest
 
-from localecho import MAX_PEN, Predictor, char_style, sgr_resets, split_safe
+from localecho import (MAX_PEN, Guarded, Predictor, ShadowScreen, ShadowStream, char_style,
+                       sgr_resets, split_safe)
 from pyte.screens import Char
 
 
@@ -10,10 +11,19 @@ from pyte.screens import Char
     (b"abc\x1b", b"abc", b"\x1b"),
     (b"abc\x1b[12;3", b"abc", b"\x1b[12;3"),
     (b"abc\x1b[12;3m", b"abc\x1b[12;3m", b""),
-    (b"x\x1b]0;title", b"x", b"\x1b]0;title"),
+    (b"x\x1b]0;title", b"x", b"\x1b]"),                      # only how it started is kept
+    (b"\x1b]" + b"rest\x07ok", b"\x1b]rest\x07ok", b""),      # ... which is all it takes
     (b"x\x1b]0;title\x07", b"x\x1b]0;title\x07", b""),
-    (b"x\x1b]0;title\x1b", b"x", b"\x1b]0;title\x1b"),     # ST split in half
+    (b"x\x1b]0;title\x1b", b"x\x1b]0;title", b"\x1b"),      # ST split in half
     (b"x\x1b]0;title\x1b\\", b"x\x1b]0;title\x1b\\", b""),
+    (b"\x1bPtmux;\x1b\x1b[31mabc", b"", b"\x1bP"),             # tmux passthrough
+    (b"\x1bPtmux;\x1b\x1b]52;c;YWJj\x07", b"", b"\x1bP"),
+    (b"\x1bPtmux;\x1b\x1b[31m\x1b\\x", b"\x1bPtmux;\x1b\x1b[31m\x1b\\x", b""),
+    (b"x\x1bPq#0\x1b", b"x", b"\x1bP\x1b"),
+    (b"\x1bP\x1b" + b"\\x", b"\x1bP\x1b\\x", b""),
+    (b"x\x1b[\n", b"x", b"\x1b[\n"),                         # controls don't end a CSI
+    (b"x\x1b[\nl", b"x\x1b[\nl", b""),
+    (b"\x1b[12\x18x", b"\x1b[12\x18x", b""),                 # CAN does
     (b"x\x1b(", b"x", b"\x1b("),
     (b"x\x1b(B", b"x\x1b(B", b""),
     (b"ok\x1b7", b"ok\x1b7", b""),
@@ -89,12 +99,49 @@ def test_sgr_resets(params, resets):
     b"\x1b[<u",           # kitty keyboard protocol
     b"\x1b[2 q",          # cursor shape
     b"\x1bP+q544e\x1b\\", # DCS query
+    b"\x1b[?3h",          # 132 columns, which terminals ignore (pyte resizes)
+    b"\x1b[?3l",          # 80 columns, sent by `reset`
+    "\x1b[1²m".encode(),  # not an ASCII digit: crashes pyte's parser
+    b"\x1b[1\x80m",       # not ASCII at all
+    b"\x1b[12\x18",       # cut short by CAN
+    b"\x1b(\x1b(B",       # cut short by ESC
+    b"\x01\x1a",          # controls that terminals ignore
 ])
 def test_unusual_sequences_do_not_disturb_the_shadow(seq):
-    p = Predictor(24, 80)
-    p.on_output(b"ab" + seq + b"cd", 0.0)
+    g = Guarded(Predictor(24, 80))
+    g.on_output(b"ab" + seq + b"cd", 0.0)
+    p = g.pred
+    assert p is not None
     assert p.screen.display[0].rstrip() == "abcd"
-    assert p.screen.cursor.x == 4
+    assert p.screen.cursor.x == 4 and p.screen.columns == 80
+
+
+def test_controls_inside_a_csi_take_effect():
+    p = Predictor(24, 80)
+    p.on_output(b"ab\x1b[\r1C\x1b[\nC", 0.0)           # CR inside one, LF inside another
+    assert (p.screen.cursor.y, p.screen.cursor.x) == (1, 2)
+
+
+def test_pyte_parser_errors_are_dropped():
+    sc = ShadowScreen(80, 24)
+    ShadowStream(sc).feed("a\x1b[1²mb".encode())
+    assert sc.display[0].rstrip() == "ab"
+
+
+def test_sub_parameters_mixed_with_plain_ones():
+    p = Predictor(24, 80)
+    p.on_output(b"\x1b[1;4:3;31mX", 0.0)
+    c = p.screen.buffer[0][0]
+    assert c.bold and c.fg == "red"
+    assert p.screen.cursor.pen == (b"1;4:3;31",)
+
+
+def test_a_sequence_split_across_reads_goes_through_the_sanitiser():
+    p = Predictor(24, 80)
+    p.on_output(b"\x1b[>4;", 0.0)                       # vim's modifyOtherKeys
+    p.on_tick(5.0)                                      # however long the rest takes
+    p.on_output(b"2mx", 5.0)
+    assert p.screen.cursor.pen == () and not p.screen.buffer[0][0].underscore
 
 
 def test_alternate_screen_restores_main_buffer():

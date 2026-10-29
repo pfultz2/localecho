@@ -15,23 +15,37 @@ def breaking(p, name):
     return p
 
 
-def test_failure_passes_output_through_with_what_was_held_back():
+def test_output_passes_straight_through_before_and_after_a_failure():
     p = Predictor(24, 80)
     g = Guarded(p)
-    assert g.on_output(b"x\x1b[3", 0.0) == b"x"          # "\x1b[3" is held back
+    assert g.on_output(b"x\x1b[3", 0.0) == b"x\x1b[3"    # unfinished, but not held back
     breaking(p, "_feed")
-    assert g.on_output(b"1mhi\x1b[", 0.1) == b"\x1b[31mhi\x1b["
+    assert g.on_output(b"1mhi\x1b[", 0.1) == b"1mhi\x1b["
     assert g.pred is None
     assert g.on_output(b"more", 0.2) == b"more"
+    assert g.finish() == b""
 
 
-def test_a_failing_deadline_falls_back_too():
-    p = Predictor(24, 80)
-    g = Guarded(p)
-    g.on_output(b"\x1b]0;tit", 0.0)                      # held back
-    breaking(p, "next_deadline")
-    assert g.next_deadline(0.0) is None
-    assert g.on_tick(0.1) == b"\x1b]0;tit"               # and not lost
+def test_failure_takes_drawn_predictions_off_first(make_rig):
+    rig = make_rig().confident()
+    rig.type("ch")                       # drawn, with the real cursor two columns ahead
+    p = rig.p
+    rig.p = Guarded(p)
+    breaking(p, "_feed")
+    rig.server(b"ch")
+    assert rig.p.pred is None
+    assert rig.line() == "$ ech" and rig.cursor() == (0, 5)
+    assert not any(rig.cell(x).underscore for x in range(6))
+
+
+def test_a_failing_deadline_cleans_up_on_the_next_tick(make_rig):
+    rig = make_rig().confident()
+    rig.type("ch")
+    p = rig.p
+    rig.p = Guarded(breaking(p, "next_deadline"))
+    assert rig.p.next_deadline(rig.now) is None
+    rig.tick(0.01)
+    assert rig.line() == "$ e" and rig.cursor() == (0, 3)
 
 
 def test_after_a_failure_everything_passes_through():
@@ -54,9 +68,3 @@ def test_without_a_predictor_everything_passes_through():
     assert g.filter_input(b"k", 0.0) == (b"k", b"")
     assert g.next_deadline(0.0) is None
     assert g.on_input(b"k", 0.0) == g.on_tick(0.0) == g.finish() == b""
-
-
-def test_finish_passes_on_held_output():
-    g = Guarded(Predictor(24, 80))
-    g.on_output(b"done\x1b[", 0.0)
-    assert g.finish() == b"\x1b["

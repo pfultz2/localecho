@@ -1,4 +1,5 @@
 """Prediction behaviour, with the test playing the remote shell."""
+import pytest
 
 LEFT, RIGHT, BS = "\x1b[D", "\x1b[C", "\x7f"
 
@@ -184,15 +185,48 @@ def test_predictions_follow_scrolling(make_rig):
     assert rig.p.keys[0].bcur == (2, 3)
 
 
-def test_partial_escape_sequence_is_held_back(rig):
+def test_nothing_is_drawn_in_the_middle_of_an_escape_sequence(rig):
     rig.confident()
-    rig.server(b"\x1b[3")                    # incomplete colour change
+    rig.server(b"\x1b[3")                    # incomplete colour change, passed on at once
     assert rig.p.held == b"\x1b[3"
-    rig.type("c")                            # drawing now is safe: terminal is between sequences
-    assert rig.line() == "$ ec"
+    rig.type("c")                            # drawing now would break it up
+    assert rig.line() == "$ e"
     rig.server(b"1m")
     assert rig.p.held == b""
+    assert rig.line() == "$ ec"
     assert rig.term.cursor.attrs.fg == "red"
+
+
+def test_nothing_is_drawn_inside_a_dcs_with_escapes_in_it(rig):
+    rig.confident()
+    rig.server(b"\x1bPtmux;\x1b\x1b[31m")    # tmux passthrough, not finished yet
+    assert rig.p.on_input(b"c", rig.now) == b""
+    assert b"c" in rig.p.on_output(b"x\x1b\\", rig.now + 0.1)
+
+
+def test_a_string_sequence_never_finished_is_given_up_on(rig):
+    rig.confident()
+    rig.server(b"\x1bPxyz")                  # a stray DCS start, from cat of a binary
+    rig.server(b"\r\nmore\r\n$ ", dt=3.0)    # (the test terminal takes it all for text)
+    rig.tick(1.0)
+    assert rig.p.held == b"\x1bP"
+    rig.tick(rig.p.STRING_TIMEOUT - 3.9)     # counted from its start, as in tmux
+    assert rig.p.held == b"" and rig.p.quarantine and rig.p.dsr_pending
+    y, x = rig.cursor()
+    assert rig.p.filter_input(b"\x1b[%d;%dR" % (y + 1, x + 1), rig.now) == (b"", b"")
+    rig.type("e")
+    rig.server(b"e")
+    rig.type("c")
+    assert rig.line() == "$ ec"
+
+
+def test_an_unfinished_string_sequence_keeps_nothing_of_its_contents(rig):
+    rig.server(b"\x1b]52;c;")                # a big clipboard copy
+    for _ in range(10):
+        rig.server(b"YWJj" * 1000, dt=0.01)
+    assert rig.p.held == b"\x1b]"
+    rig.server(b"\x07$ ")
+    assert rig.p.held == b"" and rig.p.screen.display[0].rstrip() == "$"
 
 
 def test_resize_pauses_until_cursor_is_resynced(rig):
@@ -205,6 +239,55 @@ def test_resize_pauses_until_cursor_is_resynced(rig):
     data, extra = rig.p.filter_input(b"\x1b[1;4R", rig.now)
     assert data == b"" and extra == b""      # our answer is swallowed, not sent to ssh
     assert not rig.p.quarantine
+
+
+@pytest.mark.parametrize("rows, scrolled", [(30, 0), (20, 4)])
+def test_resize_takes_drawn_predictions_off_first(rig, rows, scrolled):
+    rig.server(b"\r\n" * 23)                 # prompt on the bottom row
+    rig.confident()
+    rig.type("ch")
+    assert rig.line() == "$ ech" and rig.cursor() == (23, 5)
+    # The terminal resizes first.  Getting shorter, it keeps the cursor's
+    # line in view by scrolling.
+    rig.term.resize(rows, 80)
+    rig.term_stream.feed(rig.p.on_resize(rows, 80, rig.now))
+    y, x = rig.cursor()
+    assert (rig.line(), y, x) == ("$ e", 23 - scrolled, 3)
+    assert not any(rig.cell(x).underscore for x in range(6))
+    data, _ = rig.p.filter_input(b"\x1b[%d;%dR" % (y + 1, x + 1), rig.now)
+    assert data == b""
+    rig.server(b"ch")
+    assert rig.line() == "$ ech" and rig.cursor() == (y, 5)
+    assert rig.term.display == rig.p.screen.display
+
+
+def test_every_answer_to_a_cursor_query_is_swallowed(rig):
+    rig.confident()
+    rig.p.on_resize(30, 100, rig.now)
+    rig.p.on_resize(31, 100, rig.now)        # dragging the window: two queries
+    assert rig.p.filter_input(b"\x1b[1;4Rx\x1b[1;4R", rig.now) == (b"x", b"")
+    assert not rig.p.quarantine
+    assert rig.p.filter_input(b"\x1b[1;2R", rig.now) == (b"\x1b[1;2R", b"")   # Shift+F3
+
+
+def test_a_late_answer_is_swallowed_too(rig):
+    rig.p.on_resize(30, 100, rig.now)
+    rig.tick(rig.p.DSR_TIMEOUT)              # given up on
+    assert rig.p.filter_input(b"\x1b[1;1R", rig.now) == (b"", b"")
+    rig.p.on_resize(31, 100, rig.now)
+    rig.tick(rig.p.DSR_FORGET)               # no answer is coming
+    assert rig.p.filter_input(b"\x1b[1;2R", rig.now) == (b"\x1b[1;2R", b"")
+
+
+def test_end_of_paste_split_across_reads(rig):
+    rig.confident()
+    rig.type("\x1b[200~pasted\x1b[20")
+    rig.server(b"pasted")
+    rig.type("1~ok")
+    assert not rig.p.in_paste
+    rig.type("!")
+    rig.server(b"ok")
+    assert rig.line() == "$ epastedok!"
 
 
 def test_tentative_epoch_survives_vim_style_normal_mode(rig):

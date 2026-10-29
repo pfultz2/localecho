@@ -48,6 +48,21 @@ def test_resize_keeps_the_saved_cursor():
     assert cursor(p) == (2, 4)
 
 
+def test_getting_shorter_loses_lines_below_the_cursor_first():
+    p = shadow(b"\x1b[H\x1b[2JPassword: ")
+    p.screen.resize(20, 80)
+    assert p.screen.display[0].rstrip() == "Password:" and cursor(p) == (0, 10)
+
+
+def test_getting_shorter_scrolls_to_keep_the_cursor_in_view():
+    p = shadow(b"".join(b"line %d\r\n" % i for i in range(23)) + b"$ ")
+    p.screen.resize(20, 80)
+    assert p.screen.display[0].rstrip() == "line 4"
+    assert p.screen.display[19].rstrip() == "$" and cursor(p) == (19, 2)
+    p.screen.resize(24, 80)
+    assert p.screen.display[20].rstrip() == ""
+
+
 def test_reset_forgets_the_saved_cursor():
     p = shadow(b"\x1b[31m\x1b[5;5H\x1b7\x1bc\x1b8")
     assert cursor(p) == (0, 0)

@@ -32,9 +32,10 @@ class _Terminal(ShadowScreen):
 class Session:
     def __init__(self, cmd=None, delay=0.15, predict="adaptive", extra=(),
                  rows=24, cols=80, env=None):
-        """predict="none" runs without localecho at all (the reference)."""
+        """predict="none" runs without localecho at all (the reference),
+        and delay=None without lagpty."""
         cmd = cmd or ["bash", "--norc", "--noprofile"]
-        argv = [sys.executable, LAGPTY, str(delay)] + list(cmd)
+        argv = list(cmd) if delay is None else [sys.executable, LAGPTY, str(delay)] + list(cmd)
         if predict != "none":
             argv = ([sys.executable, localecho.__file__, "--predict=" + predict]
                     + list(extra) + ["--"] + argv)

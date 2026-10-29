@@ -25,7 +25,11 @@ def test_fast_forward_matches_full_emulation(seed):
     p = Predictor(rows, cols)
     ref = ShadowScreen(cols, rows)
     ref_stream = ShadowStream(ref)
-    p.screen.cursor.y = ref.cursor.y = rnd.randrange(rows)
+    # Start with something on the screen, the cursor anywhere in it.
+    before = "\r\n".join("#" * rnd.randrange(cols) for _ in range(rows)).encode()
+    before += b"\x1b[%d;%dH" % (rnd.randrange(rows) + 1, rnd.randrange(cols) + 1)
+    p.on_output(before, 0.0)
+    ref_stream.feed(before)
     data = random_output(rnd)
     i = 0
     while i < len(data):
@@ -48,6 +52,18 @@ def test_fast_forward_keeps_the_pen():
     assert fast.screen.cursor.pen == slow.screen.cursor.pen == (b"0;1", b"4:3", b"33")
     assert fast.screen.cursor.attrs == slow.screen.cursor.attrs
     assert fast.screen.display == slow.screen.display
+
+
+def test_text_left_over_from_before_is_kept():
+    before = b"xxxxxxxxxx\r\n" * 4 + b"xxxxxxxxxx" + b"\x1b[H"
+    data = b"a\r\n" * 7 + b"b"
+    p = Predictor(5, 20)
+    p.on_output(before, 0.0)
+    p.on_output(data, 0.0)
+    ref = ShadowScreen(20, 5)
+    ShadowStream(ref).feed(before + data)
+    assert p.screen.display == ref.display
+    assert ref.display[0].rstrip() == "axxxxxxxxx"
 
 
 def test_cursor_addressing_disables_the_shortcut():
