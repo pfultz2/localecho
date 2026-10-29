@@ -7,10 +7,11 @@ arrive, so whatever is on screen then was drawn by localecho.
 """
 import os
 import shutil
+import sys
 
 import pytest
 
-from ptyterm import Session
+from ptyterm import HERE, Session
 
 pytestmark = [
     pytest.mark.integration,
@@ -37,31 +38,48 @@ def sessions():
         s.close()
 
 
-def ready_shell(s):
-    assert s.wait_for("$"), s.lines()
+def ready_shell(s, prompt="$"):
+    assert s.wait_for(prompt), s.lines()
     s.pump(0.3)
     s.send("e", SETTLE)      # first echo lets localecho measure the link and trust it
     return s
 
 
+EDIT_KEYS = list("cho abc") + [LEFT, LEFT, "X", BS, "Y", RIGHT, "z", BS, BS, "Q"]
+
+
+def replay(s, wait, state):
+    """Type EDIT_KEYS, noting state(s) `wait` seconds after each key."""
+    seen = []
+    for k in EDIT_KEYS:
+        s.send(k, wait)
+        seen.append(state(s))
+    return seen
+
+
 def test_editing_keys_show_what_the_server_will_show(sessions):
-    keys = list("cho abc") + [LEFT, LEFT, "X", BS, "Y", RIGHT, "z", BS, BS, "Q"]
+    def state(s):
+        return s.line(), s.cursor()
 
-    truth = ready_shell(sessions(predict="none"))
-    expected = []
-    for k in keys:
-        truth.send(k, SETTLE)
-        expected.append((truth.line(), truth.cursor()))
-
+    expected = replay(ready_shell(sessions(predict="none")), SETTLE, state)
     pred = ready_shell(sessions())
-    shown = []
-    for k in keys:
-        pred.send(k, FAST)
-        shown.append((pred.line(), pred.cursor()))
-
-    assert shown == expected
+    assert replay(pred, FAST, state) == expected
     pred.send("\r", SETTLE)
     assert pred.lines()[1] == "aYQc"
+
+
+def test_drawn_cursor_like_claude_code(sessions):
+    def state(s):
+        y = next(y for y, line in enumerate(s.lines()) if line.startswith(">"))
+        row = s.screen.buffer[y]
+        return s.lines()[y], [x for x in range(s.screen.columns) if row[x].reverse]
+
+    cmd = [sys.executable, os.path.join(HERE, "inkapp.py")]
+    expected = replay(ready_shell(sessions(predict="none", cmd=cmd), ">"), SETTLE, state)
+    pred = ready_shell(sessions(cmd=cmd), ">")
+    assert replay(pred, FAST, state) == expected
+    pred.send("\r", SETTLE)
+    assert "got:echo aYQc" in pred.lines()
 
 
 def test_predictions_are_marked_until_echoed(sessions):

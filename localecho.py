@@ -35,6 +35,10 @@ shifting right, the cursor moving) is drawn on your screen straight away.
 When the server's echo arrives, the guess is checked against the shadow
 screen.
 
+Some programs, such as Claude Code and other Ink applications, hide the
+terminal's cursor and draw their own as a reverse-video cell.  Then the
+guess is made at that cell, and the drawn cursor moves along with the text.
+
 Like mosh, a guess is only *shown* once an earlier guess in the same
 "epoch" has been confirmed by the server.  Pressing Enter, Tab, a control
 key or anything else that can't be predicted starts a new epoch, so after a
@@ -250,16 +254,19 @@ class ShadowScreen(pyte.Screen):
         self.region_scrolled = True
 
     # A terminal has one saved cursor, not pyte's stack: saving again
-    # replaces it, and restoring doesn't use it up.
+    # replaces it, and restoring doesn't use it up.  Nor does it save
+    # whether the cursor is hidden.
     def save_cursor(self):
         super().save_cursor()
         del self.savepoints[:-1]
 
     def restore_cursor(self):
+        hidden = self.cursor.hidden
         if self.savepoints:
             sp = self.savepoints[-1]
             self.savepoints.append(sp._replace(cursor=copy.copy(sp.cursor)))
         super().restore_cursor()
+        self.cursor.hidden = hidden
 
     def resize(self, lines=None, columns=None):
         # pyte saves and restores the cursor around its own work.
@@ -405,7 +412,7 @@ for _name in (set(ShadowStream.csi.values()) | set(ShadowStream.escape.values())
 class Key:
     """One predicted keystroke.
 
-    cells: {(y, x): (text, sgr_bytes)} cells it changes on screen
+    cells: {(y, x): (text, sgr_bytes) or Char} cells it changes on screen
     head:  (y, x, ch) for a typed character - the cell whose echo confirms it
     hard(pos): must this cell match before the keystroke counts as processed?
            (a typed character's own cell, or everything a backspace changes;
@@ -459,6 +466,8 @@ class Predictor:
         self.dsr_pending = None
         self.dsr_tries = 0
         self.mismatch_since = None
+        self.block = None        # (fed, candidates) for the cursor the application draws
+        self.caret = None        # its cell, when the pending keys are typed at it
 
     # ---- logging ---------------------------------------------------------
     def log(self, msg):
@@ -545,10 +554,42 @@ class Predictor:
     def _cell(self, y, x):
         return self.screen.buffer[y][x].data
 
+    def _cursor(self):
+        """Where typed text goes: the terminal's cursor or, if the
+        application has hidden it, the cursor it draws itself.  None if
+        there is no telling."""
+        sc = self.screen
+        if not sc.cursor.hidden:
+            return (sc.cursor.y, sc.cursor.x)
+        if self.block is None or self.block[0] != self.fed:
+            self.block = (self.fed, self._find_blocks())
+        found = self.block[1]
+        return found[0] if len(found) == 1 else None
+
+    def _find_blocks(self):
+        """Ink applications (Claude Code, for one) hide the cursor and show
+        a reverse-video cell instead.  Find up to two reverse-video cells
+        standing on their own (bars don't count): the cursor, if it is the
+        only one."""
+        sc = self.screen
+        found = []
+        if mo.DECSCNM in sc.mode:               # the whole screen is reversed
+            return found
+        for y, line in sc.buffer.items():
+            if y >= sc.lines:
+                continue
+            for x, c in line.items():
+                if (c.reverse and x < sc.columns
+                        and not line[x - 1].reverse and not line[x + 1].reverse):
+                    found.append((y, x))
+                    if len(found) == 2:
+                        return found
+        return found
+
     def _evaluate(self, now):
         sc = self.screen
-        cur = (sc.cursor.y, sc.cursor.x)
         if self.keys:
+            cur = self._cursor()
             # Find the newest keystroke whose predicted screen state (the
             # cursor, plus every required cell of it and the keystrokes
             # before it) is what the server is showing now.
@@ -574,8 +615,9 @@ class Predictor:
                 if self.mismatch_since is None:
                     self.mismatch_since = now
                     if self.log_file:
+                        y = (cur or self.keys[0].bcur)[0]
                         self.log("mismatch: cursor=%s row=%r keys=%s" % (
-                            cur, "".join(self._cell(cur[0], x) for x in range(min(sc.columns, 40))),
+                            cur, "".join(self._cell(y, x) for x in range(min(sc.columns, 40))),
                             [(k.kind, k.head, k.bcur, k.ecur) for k in self.keys]))
             elif now - self.keys[0].t > self._late():
                 self._reset("keystroke had no visible effect")
@@ -649,6 +691,7 @@ class Predictor:
                 sc.buffer[y].pop(xx, None)
             for yy in range(y + 1, sc.lines):
                 sc.buffer.pop(yy, None)
+            self.block = None
         self.quarantine = False
         self.log("cursor resynced to %d,%d" % (y, x))
         return data, b""
@@ -673,38 +716,51 @@ class Predictor:
                 i += len(seq)
                 if seq == b"\x1b[200~":
                     self.in_paste = True
-                    self._barrier()
+                    self._barrier("paste")
                 elif seq in self.MOVES:
                     self._key_move(self.MOVES[seq], now)
                 elif seq not in (b"\x1b[I", b"\x1b[O"):     # focus in/out
-                    self._barrier()
+                    self._barrier("key %r" % seq)
             elif b in (0x7F, 0x08):
                 self._key_backspace(now)
                 i += 1
             elif b < 0x20:
-                self._barrier()
+                self._barrier("key %r" % data[i:i + 1])
                 i += 1
             else:
                 ln = 1 if b < 0x80 else 2 if b < 0xE0 else 3 if b < 0xF0 else 4
                 try:
                     ch = data[i:i + ln].decode("utf-8")
                 except UnicodeDecodeError:
-                    self._barrier()
+                    self._barrier("undecodable input")
                 else:
                     self._key_char(ch, now)
                 i += ln
         return self._render() + self._maybe_query(now)
 
-    def _barrier(self):
+    def _barrier(self, why):
         """A key whose effect we can't predict: stop until the server catches up."""
+        self.log("barrier: %s (input from %s)" % (why, self.input_start))
         self.blocked = True
         self.epoch += 1
         self.input_start = None
 
     def _next_cursor(self):
+        """Where the next keystroke goes: after the pending ones or, if there
+        are none, at the cursor.  Starting afresh also settles which cursor
+        that is: self.caret is the cell of the one the application draws,
+        or None for the terminal's own.  None if the key can't be predicted."""
+        if self.blocked:
+            return None
         if self.keys:
             return self.keys[-1].ecur
-        return (self.screen.cursor.y, self.screen.cursor.x)
+        cur = self._cursor()
+        if cur is None:
+            self._barrier("cursor hidden; lone reverse-video cells at %s" % self.block[1])
+            return None
+        sc = self.screen
+        self.caret = sc.buffer[cur[0]][cur[1]] if sc.cursor.hidden else None
+        return cur
 
     def _row(self, y):
         """Row y as it will look once all pending keystrokes are processed."""
@@ -735,12 +791,6 @@ class Predictor:
                 gap, last = 0, xx
         return last
 
-    @staticmethod
-    def _as_cell(v):
-        if isinstance(v, Char):
-            return (v.data, char_style(v))
-        return v
-
     def _narrow(self, row, lo, hi):
         for xx in range(max(lo, 0), min(hi, len(row) - 1) + 1):
             d = row[xx][0]
@@ -755,21 +805,32 @@ class Predictor:
             return char_style(cur.attrs)
         return b"\x1b[0m" + b"".join(b"\x1b[" + p + b"m" for p in cur.pen)
 
+    def _ink(self, ch):
+        """A cell showing `ch` as typed text: in the server's pen or, with a
+        drawn cursor, in the cursor's colours."""
+        if self.caret is None:
+            return (ch, self._pen_bytes())
+        return self.caret._replace(data=ch, reverse=False)
+
     def _key_char(self, ch, now):
-        if self.blocked:
+        pos = self._next_cursor()
+        if pos is None:
             return
         sc = self.screen
-        y, x = self._next_cursor()
-        if wcwidth(ch) != 1 or x >= sc.columns - 1 or sc.cursor.x >= sc.columns:
-            return self._barrier()
+        y, x = pos
+        if (wcwidth(ch) != 1 or x >= sc.columns - 1
+                or self.caret is None and sc.cursor.x >= sc.columns):
+            return self._barrier("character at %s" % (pos,))
         row = self._row(y)
         end = self._run_end(row, x)
+        if self.caret is not None:
+            end = max(end, x)                   # a drawn cursor moves right too
         if end >= sc.columns - 1 or not self._narrow(row, x - 1, end + 1):
-            return self._barrier()
+            return self._barrier("character at %s, line to %d" % (pos, end))
         cells = {}
         for xx in range(end + 1, x, -1):       # insert: shift the rest right
-            cells[(y, xx)] = self._as_cell(row[xx - 1])
-        cells[(y, x)] = (ch, self._pen_bytes())
+            cells[(y, xx)] = row[xx - 1]
+        cells[(y, x)] = self._ink(ch)
         if self.input_start is None or self.input_start[0] != y:
             self.input_start = (y, x)
         self.keys.append(Key("char", cells, (y, x), (y, x + 1), now, self.epoch))
@@ -780,30 +841,38 @@ class Predictor:
         return st is not None and st[0] == y and x >= st[1]
 
     def _key_backspace(self, now):
-        if self.blocked:
+        pos = self._next_cursor()
+        if pos is None:
             return
-        y, x = self._next_cursor()
+        y, x = pos
         if not self._typed(y, x - 1):
-            return self._barrier()
+            return self._barrier("backspace at %s" % (pos,))
         row = self._row(y)
         end = self._run_end(row, x)
+        if self.caret is not None:
+            end = max(end, x)                   # a drawn cursor moves left too
         if not self._narrow(row, x - 1, end + 1):
-            return self._barrier()
+            return self._barrier("backspace at %s, line to %d" % (pos, end))
         cells = {}
         for xx in range(x - 1, max(end, x - 1) + 1):   # delete: shift left
-            src = row[xx + 1] if xx + 1 <= end else (" ", self._pen_bytes())
-            cells[(y, xx)] = self._as_cell(src)
+            cells[(y, xx)] = row[xx + 1] if xx + 1 <= end else self._ink(" ")
         self.keys.append(Key("bs", cells, (y, x), (y, x - 1), now, self.epoch))
 
     def _key_move(self, d, now):
-        if self.blocked:
+        pos = self._next_cursor()
+        if pos is None:
             return
-        y, x = self._next_cursor()
+        y, x = pos
         nx = x + d
+        row = self._row(y)
         if (not self._typed(y, nx) or nx >= self.screen.columns - 1
-                or d > 0 and self._run_end(self._row(y), x) < x):   # nothing to move over
-            return self._barrier()
-        self.keys.append(Key("mv", {}, (y, x), (y, nx), now, self.epoch))
+                or d > 0 and self._run_end(row, x) < x):   # nothing to move over
+            return self._barrier("arrow at %s" % (pos,))
+        cells = {}
+        if self.caret is not None:              # move the drawn cursor
+            cells = {(y, x): row[x]._replace(reverse=False),
+                     (y, nx): row[nx]._replace(reverse=True)}
+        self.keys.append(Key("mv", cells, (y, x), (y, nx), now, self.epoch))
 
     # ---- timers and resizes ----------------------------------------------
     def next_deadline(self, now):
@@ -847,6 +916,7 @@ class Predictor:
         # our control, so just forget it.
         self.shown.clear()
         self.cursor_at = None
+        self.block = None
         self._reset("window resized")
         self.quarantine = True
         self.dsr_tries = 0
@@ -865,11 +935,11 @@ class Predictor:
         return out
 
     # ---- drawing ----------------------------------------------------------
-    def _password_prompt(self):
+    def _password_prompt(self, cur):
         sc = self.screen
-        y = sc.cursor.y
+        y = cur[0]
         line = sc.buffer[y]
-        text = "".join(line[x].data for x in range(min(sc.cursor.x, sc.columns)))
+        text = "".join(line[x].data for x in range(min(cur[1], sc.columns)))
         if y > 0:
             prev = sc.buffer[y - 1]
             text = "".join(prev[x].data for x in range(sc.columns)) + text
@@ -879,13 +949,12 @@ class Predictor:
         if not self.showing or self.unsafe or self.quarantine:
             return False
         sc = self.screen
-        if sc.cursor.x >= sc.columns:           # pending autowrap
-            return False
         if mo.DECOM in sc.mode or mo.IRM in sc.mode:
             return False
         if (sc.g1_charset if sc.charset else sc.g0_charset) != cs.LAT1_MAP:
             return False
-        return not self._password_prompt()
+        # There's no cursor while a frame is half drawn: go by the keystrokes.
+        return not self._password_prompt(self._cursor() or self.keys[0].bcur)
 
     def _restore_cell(self, pos):
         y, x = pos
@@ -914,21 +983,30 @@ class Predictor:
                 out += self._restore_cell(pos)
                 del self.shown[pos]
         for pos, want in desired.items():
-            text, style = want
             if self.shown.get(pos) == want:
                 continue
-            if pos not in self.shown and text.strip() and self._cell(*pos) == text:
+            c = sc.buffer[pos[0]][pos[1]]
+            if isinstance(want, Char):
+                text, style, same = want.data, char_style(want), c == want
+            else:
+                (text, style), same = want, c.data == want[0]
+            if pos not in self.shown and text.strip() and same:
                 continue                         # already looks right
             out += goto(pos) + style + mark + text.encode()
             self.shown[pos] = want
         shadow_cur = (sc.cursor.y, sc.cursor.x)
-        target = dcur or shadow_cur
-        if out:
-            out += goto(target) + self._pen_bytes()
-        elif (self.cursor_at or shadow_cur) != target:
-            out += goto(target)
-        else:
+        # A hidden cursor stays put: the application draws its own.
+        target = shadow_cur if sc.cursor.hidden else dcur or shadow_cur
+        if not out and (self.cursor_at or shadow_cur) == target:
             return b""
+        if target[1] >= sc.columns:
+            # Pending autowrap: rewriting the last cell is the only way to
+            # put the terminal back in that state.
+            out += self._restore_cell((target[0], sc.columns - 1)) + self._pen_bytes()
+        elif out:
+            out += goto(target) + self._pen_bytes()
+        else:
+            out += goto(target)
         self.cursor_at = None if target == shadow_cur else target
         return bytes(out)
 

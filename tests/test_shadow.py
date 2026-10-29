@@ -27,6 +27,11 @@ def test_restoring_twice_returns_to_the_same_place():
     assert cursor(shadow(b"\x1b[3;5H\x1b7one\x1b8two\x1b8")) == (2, 4)
 
 
+def test_restoring_the_cursor_keeps_it_hidden():
+    assert shadow(b"\x1b7\x1b[?25l\x1b8").screen.cursor.hidden
+    assert not shadow(b"\x1b[?25l\x1b7\x1b[?25h\x1b8").screen.cursor.hidden
+
+
 def test_saving_again_replaces_the_saved_cursor():
     assert cursor(shadow(b"\x1b[3;5H\x1b7\x1b[9;9H\x1b7\x1b[H\x1b8\x1b8")) == (8, 8)
 

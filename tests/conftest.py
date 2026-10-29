@@ -46,11 +46,11 @@ class Rig:
     def cursor(self):
         return (self.term.cursor.y, self.term.cursor.x)
 
-    def confident(self, prompt=b"$ "):
+    def confident(self, prompt=b"$ ", echo=b"e"):
         """Show a prompt and confirm one echo, so later predictions display."""
         self.server(prompt)
         self.type("e")
-        self.server(b"e")
+        self.server(echo)
         return self
 
 
