@@ -16,6 +16,12 @@ localecho's own options go before the command; everything from the command
 on is passed to it unchanged. There is no point wrapping `mosh`, which already
 predicts on its own. See `localecho --help` for all options.
 
+You can also install it from the source tarballs from github:
+
+```
+pip install https://github.com/pfultz2/localecho/archive/master.tar.gz
+```
+
 ## Tests
 
 ```
